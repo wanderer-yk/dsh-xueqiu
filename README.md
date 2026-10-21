@@ -190,6 +190,19 @@ dsh-xueqiu/
 
 ## 📋 更新日志
 
+- **1.22.16**（2026-10-21）
+  - 修复：**适配新版 DSH shell API**（`shell.run` 移除导致所有请求报 `shell.run is not a function`、自选股不展示）。新增 `runShell` 兼容层：旧版走 `run`，新版走 `execute`+`result()`。
+  - 修复：**curl 命令注入防御**——URL 单引号统一转义 `%27`（`encodeURIComponent` 不转义 `'`）；kline symbol 剥除非白名单字符，剥除后为空立即返回空结果。
+  - 修复：**WAF 挑战页自愈**——HTML 响应从致命 `[parse]` 改为 `[waf]` 可重试：仅首轮且匿名路径触发重播种（带 5s 冷却窗）；播种成功判据收紧为拿到 `xq_a_token`，失败不再缓存废 cookie。
+  - 修复：**K线历史翻页步长**——`begin` 按周期回退一个安全步长（实测上游 inclusive 语义；month 取 20 天，当月未收线 bar 与上一根 gap 可小至 21 天），防 `forward:false` 永久截断。
+  - 修复：**client RPC 15s 超时**——静态版 `AbortSignal.timeout` + 老 WebView race 兜底 + `res.ok`/JSON 防护；动态版 `host.call` race 看门狗。
+  - 修复：**RPC dispatch 原型键绕过**（`action='constructor'` 命中原型真值函数，改 `hasOwnProperty` 白名单）；**登录/自选加载竞态**（迟到文件内容不再覆盖并发 logout/save/add）；**触屏 pointercancel 误触发面板开合**；**行情轮询竞态**（mktSeq 三道守卫含 catch）。
+  - 变更：gen-static 生成器升级为 call() 函数级替换（旧单行替换会使静态版看门狗失效）。
+  - 安全：**登录 Cookie 不再进进程 argv**——经 stdin 以 `-H @-` 注入（`ps` 不可见、不落盘），值剥除换行防 header 注入。
+  - 安全：**状态文件 .bak 兜底**——主文件写成功后写伴生 `.bak`，半截 JSON 损坏时读取侧自动回退，最坏丢"最后一次写"而非整份自选。
+  - 修复：登录/注销时清空行情缓存（缓存 key 不含登录维度，旧数据 24h TTL 内不再跨身份泄漏）；自选 200 上限前置拦截（不再静默截断丢尾巴）；RPC actQuote symbols 钳制 50。
+  - 修复（长运行）：**工具卡 K 线图离屏休眠**（IntersectionObserver，回视口自动恢复）——会话消息不卸载，此前每张卡 ~3.4MB canvas 永久累积；K 线历史前插 5000 根封顶 + 前插结果不进缓存（零复用）；news 文本 200 字截断 + 翻页 500 条上限；云同步失败也推进节流（cookie 过期后不再每天 ~1.3 万无效请求）；注销落盘竞态哨兵（旧文件读回已注销身份）。
+  - 修复（测试保真）：mock shell 对齐真实 DSH v24.16 的 `execute`+`result()` 形态（生产必经分支此前零单测）；`login.status.path` 在真实 fs（resolve 返回对象）下统一为可读字符串；补身份切换缓存失效三连/login.save 成功链路（含 .bak）/登录态 WAF 不播种/stdin+POST 形状共 9 条盲区测试。
 - **1.22.15**（2026-09-03）
   - 变更：元数据脱敏补丁。更新日志措辞去除旧账号字样；npm 维护者信息刷新。功能零变更。
 - **1.22.14**（2026-09-03）

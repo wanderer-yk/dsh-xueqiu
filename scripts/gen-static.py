@@ -38,14 +38,51 @@ host_static = 'export default {' + host_body[len('return {'):] + '\n'
 # ---- client: CJS 工厂 + 两个模式替换 ----
 if "styles.insert(" not in client_body:
     die('dynamic/client.js 缺少 styles.insert —— 转换锚点漂移，请更新本脚本')
-if "host.call('xq.call'" not in client_body:
-    die("dynamic/client.js 缺少 host.call('xq.call') —— 转换锚点漂移，请更新本脚本")
+
+# call() 传输层函数级替换：dynamic 用 host.call + race 看门狗；静态版必须是同源 fetch 的
+# 完整实现（AbortSignal 超时 + 老 WebView race 兜底 + res.ok + JSON 解析防护）。
+# 注意不能做单行 `await host.call(...)` 字面替换——race 数组里的 await 会先于 race 执行，
+# 看门狗将完全失效（fetch 永挂时到不了 race）。两份函数文本必须同步演进。
+DYNAMIC_CALL = """    async function call(action, args) {
+      // host.call 无内建超时：race 15s 看门狗，host 卡住时面板不能永久假死
+      let t
+      const watchdog = new Promise(function (_, rej) { t = setTimeout(function () { rej(new Error('host 调用超时 (15s)')) }, 15000) })
+      const r = await Promise.race([host.call('xq.call', { action: action, args: args || {} }), watchdog]).finally(function () { clearTimeout(t) })
+      if (!r || !r.ok) throw new Error((r && r.error) || '调用失败')
+      return r.data
+    }"""
+STATIC_CALL = """    async function call(action, args) {
+      // 超时 + 状态检查：host 卡住时不能让面板永久假死；非 JSON/5xx 给可读错误
+      // AbortSignal.timeout 需 Chrome 103+/Safari 16+；老 WebView 缺失时退回 race 看门狗（不能永挂也不能全挂）
+      let res
+      if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+        try {
+          res = await fetch('/xq-rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action, args: args || {} }), signal: AbortSignal.timeout(15000) })
+        } catch (e) {
+          if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) throw new Error('请求超时 (15s)')
+          throw e
+        }
+      } else {
+        let t
+        const watchdog = new Promise(function (_, rej) { t = setTimeout(function () { rej(new Error('请求超时 (15s)')) }, 15000) })
+        res = await Promise.race([
+          fetch('/xq-rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action, args: args || {} }) }),
+          watchdog
+        ]).finally(function () { clearTimeout(t) })
+      }
+      if (!res.ok) throw new Error('请求失败 (HTTP ' + res.status + ')')
+      let r
+      try { r = await res.json() } catch (e) { throw new Error('响应不是有效 JSON（host 异常）') }
+      if (!r || !r.ok) throw new Error((r && r.error) || '调用失败')
+      return r.data
+    }"""
+if DYNAMIC_CALL not in client_body:
+    die("dynamic/client.js 缺少 host.call 版 call() 函数（锚点漂移）—— 请同步更新本脚本的 DYNAMIC_CALL/STATIC_CALL")
 
 c = client_body.replace("styles.insert(", "insertStyle(")
-c = c.replace(
-    "await host.call('xq.call', { action: action, args: args || {} })",
-    "await fetch('/xq-rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action, args: args || {} }) }).then(function (res) { return res.json() })",
-)
+c = c.replace(DYNAMIC_CALL, STATIC_CALL)
+if 'host.call' in c:
+    die('静态版 client 仍残留 host.call —— 替换未生效')
 # 函数体顶层 return {...} → exports.default = {...}（loader 取 exports.default ?? exports）
 assert c.startswith('return {')
 c = 'exports.default = {' + c[len('return {'):]

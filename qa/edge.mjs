@@ -184,13 +184,13 @@ async function expectStructured(group, name, p, opts = {}) {
   if (r) record('API异常', '429 错误码出现在 error 信息中', /rate_limited|频繁/.test(r.error || ''), 'error=' + r.error)
   record('API异常', '指数退避实际耗时≥6s（2s+4s）', Date.now() - t0 >= 5900, '耗时=' + (Date.now() - t0) + 'ms，请求次数=' + n)
 }
-// d) HTML 登录页（200 + HTML body）→ parse 错误
+// d) HTML 登录页（200 + HTML body）→ waf 自愈重试（2 轮耗尽后报 [waf]；v1.22.16 前为 [parse] 不重试）
 {
   const { call } = makePlugin({ shell: fakeShell((cmd) => cmd.includes(' -D - ')
     ? { exitCode: 0, stdout: { text: 'set-cookie: xq_a_token=a\n' }, stderr: { text: '' } }
     : { exitCode: 0, stdout: { text: '<!DOCTYPE html><html><body>请登录</body></html>' }, stderr: { text: '' } }) })
   const r = await expectStructured('API异常', 'HTML 登录页返回', call('quote', { symbols: 'SH600519' }), { timeoutMs: 25000 })
-  if (r) record('API异常', 'HTML 返回被分类为 parse 错误', /\[parse\]/.test(r.error || ''), 'error=' + r.error)
+  if (r) record('API异常', 'HTML 返回被分类为 waf 错误（重试耗尽后）', /\[waf\]/.test(r.error || ''), 'error=' + r.error)
 }
 // e) 空 body → empty 重试链（含 reseed cookie）
 {

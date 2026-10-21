@@ -63,17 +63,20 @@ function resolvePwshExe() {
 export function realShell() {
   return {
     resolve: (spec) => spec,
-    run: async (spec) => {
-      try {
+    // 对齐真实 DSH v24.16 ShellExecutor：只有 resolve+execute（无 run），execute 返回句柄、result() 给前台结果
+    execute: async (spec) => ({
+      result: async () => {
+        try {
         const opts = { timeout: spec.timeoutMs, maxBuffer: spec.stdoutMaxBytes || 4 * 1024 * 1024 }
         const { stdout, stderr } = IS_WIN
           ? await run(resolvePwshExe(), ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', ENCODING_PREAMBLE + spec.command], opts)
           : await run('/bin/bash', ['-c', spec.command], opts)
         return { exitCode: 0, stdout: { text: stdout }, stderr: { text: stderr || '' } }
       } catch (e) {
-        return { exitCode: e.code ?? 1, stdout: { text: e.stdout || '' }, stderr: { text: e.stderr || e.message } }
-      }
-    },
+          return { exitCode: e.code ?? 1, stdout: { text: e.stdout || '' }, stderr: { text: e.stderr || e.message } }
+        }
+      },
+    }),
   }
 }
 

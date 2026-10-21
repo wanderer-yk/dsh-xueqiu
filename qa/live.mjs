@@ -78,6 +78,23 @@ for (const period of ['day', 'week', '60m', '5m']) {
   const p2 = await call('kline', { symbol: 'SH600519', count: 20, begin: earliest })
   ok(p2.ok && D(p2).rows[D(p2).rows.length - 1].timestamp === earliest && D(p2).rows.slice(0, -1).every((k) => k.timestamp < earliest), 'kline begin 翻页取更早历史(含边界根)')
 }
+{
+  // begin 边界语义判别（fetchEarlierKline 的 STEP 步长设计依赖此语义）：
+  // 取相邻两根月K的中点作 begin——返回最新一根 = 前一根 ⇒ inclusive（≤begin）；
+  // = 后一根 ⇒ ceil（≥begin 第一根）。2026-10-21 实测为 inclusive；若此断言失败，
+  // 说明上游语义变更，须重审 client fetchEarlierKline 的 STEP 表（month=20d 基于 inclusive）。
+  const m = await call('kline', { symbol: 'SH600519', period: 'month', count: 6 })
+  const rows = D(m).rows
+  ok(m.ok && rows.length >= 3, 'month kline 至少 3 根用于边界判别')
+  if (m.ok && rows.length >= 3) {
+    const raw = rows[rows.length - 1].timestamp
+    const prev = rows[rows.length - 2].timestamp
+    const mid = prev + Math.floor((raw - prev) / 2)
+    const q = await call('kline', { symbol: 'SH600519', period: 'month', count: 5, begin: mid })
+    const first = D(q).rows[D(q).rows.length - 1].timestamp
+    ok(first === prev, `begin 中点返回前一根 ⇒ inclusive 语义 (first=${first}, prev=${prev}; 若=${raw} 则为 ceil，须重审 STEP 表)`)
+  }
+}
 
 console.log('== L3 热榜/搜索/帖子 ==')
 {

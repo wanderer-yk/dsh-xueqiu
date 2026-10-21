@@ -87,6 +87,7 @@ return {
     function cacheGet(key, ttl) {
       const e = cache.get(key)
       if (e && ttl > 0 && Date.now() - e.at < ttl) return e.value
+      if (e && ttl > 0) cache.delete(key)   // 已过期：顺手清除（前插历史 key 零复用，不删则驻留到 FIFO 挤出）
       return undefined
     }
 
@@ -124,9 +125,19 @@ return {
 
     function getShell() { return ctx.get('shell') }
 
+    // 兼容层：新版 DSH shell 服务移除了 run()，改为 execute(spec) 返回进程句柄，
+    // 前台结果需再调 handle.result()；旧版保留 run() 时直接走原路径。
+    async function runShell(shell, spec) {
+      if (typeof shell.run === 'function') return shell.run(spec)
+      const proc = await shell.execute(spec)
+      return proc.result()
+    }
+
     let cookieSeeding = null
     async function ensureCookie(force) {
       if (state.cookie && !force) return state.cookie
+      // 播种失败冷却：上游断网/被封时每个请求都打 2 个种子 curl 会形成风暴，失败后 5s 内直接走无 cookie 路径
+      if (state.seedFailedAt && Date.now() - state.seedFailedAt < 5000) return ''
       if (cookieSeeding) return cookieSeeding // 并发去重：同一时刻只播种一次
       const shell = getShell()
       if (!shell) return ''
@@ -144,7 +155,7 @@ return {
         const cmd = CURL + " -s -L --max-time 12 -D - -o " + NULL_DEV + " '" + seedUrls[i] + "' -H 'User-Agent: " + UA + "'"
         const spec = shell.resolve({ command: cmd, timeoutMs: 15000, stdoutMaxBytes: 65536 })
         let res = null
-        try { res = await shell.run(spec) } catch (e) { res = null }
+        try { res = await runShell(shell, spec) } catch (e) { res = null }
         if (!res || res.exitCode !== 0) continue
         seen = {}
         pairs = []
@@ -155,6 +166,14 @@ return {
         }
         if (seen.xq_a_token) break // 拿到核心 token，播种成功
       }
+      // 播种成功的唯一判据是拿到 xq_a_token；全部失败则清空 cookie，
+      // 不得把仅含 u=随机 的废 cookie 写入 state（会被后续短路，永不再播种）
+      if (!seen.xq_a_token) {
+        state.cookie = ''
+        state.seedFailedAt = Date.now()   // 记录失败时刻，供冷却窗口判断
+        return ''
+      }
+      state.seedFailedAt = 0
       // kline 端点要求 cookie 里存在 u=<id>；优先用种子响应里的真实 u，缺失才补随机值
       if (!seen.u) pairs.push('u=' + String(Date.now()) + String(Math.floor(Math.random() * 1e6)))
       state.cookie = pairs.join('; ')
@@ -167,6 +186,9 @@ return {
 
     async function curl(url, opts) {
       opts = opts || {}
+      // 命令注入防御：URL 用单引号拼接进 shell 命令，而 encodeURIComponent 不转义单引号，
+      // 必须在此显式转义（与下方 body 的 %27 处理对齐）
+      url = String(url).replace(/'/g, '%27')
       const shell = getShell()
       if (!shell) throw new Error('shell 服务不可用，无法访问雪球')
       // 登录态优先：请求头用用户 Cookie；显式 cookie 参数（登录校验）最高；
@@ -178,12 +200,18 @@ return {
       cmd += " -H 'User-Agent: " + UA + "'"
       cmd += " -H 'Referer: https://www.xueqiu.com/'"
       cmd += " -H 'Accept: application/json'"
-      if (cookie) cmd += " -H 'Cookie: " + String(cookie).replace(/['"]/g, '') + "'"
+      let stdin
+      if (cookie) {
+        // 登录态不进 argv（ps 可见）、不落临时文件（无删除原语）：经 stdin 以 -H @- 注入 header。
+        // 剥除引号与换行——stdin 中换行即新 header 行，必须防 header 注入
+        cmd += ' -H @-'
+        stdin = 'Cookie: ' + String(cookie).replace(/['"\r\n]/g, '') + '\n'
+      }
       if (opts.body) {
         cmd += " -H 'Content-Type: application/x-www-form-urlencoded' --data '" + String(opts.body).replace(/'/g, '%27') + "'"
       }
-      const spec = shell.resolve({ command: cmd, timeoutMs: 15000, stdoutMaxBytes: 4194304 })
-      const result = await shell.run(spec)
+      const spec = shell.resolve({ command: cmd, timeoutMs: 15000, stdoutMaxBytes: 4194304, stdin: stdin })
+      const result = await runShell(shell, spec)
       if (result.exitCode !== 0) {
         // 不回显 stderr：bash 语法错误会把完整命令行（含内部拼接细节）透给调用方
         throw new Error('curl 失败 (' + result.exitCode + ')')
@@ -215,7 +243,14 @@ return {
           try { text = await curl(url, { cookie: opts.cookie, anonymous: anonymous }) } catch (e) { return { kind: 'network', message: e.message, retryable: depth < 1 } }
           if (!text) return { kind: 'empty', message: '雪球返回空响应（可能被风控）', retryable: true }
           let data
-          try { data = JSON.parse(text) } catch (e) { return { kind: 'parse', message: '响应解析失败: ' + text.slice(0, 120), retryable: false } }
+          try { data = JSON.parse(text) } catch (e) {
+            // 返回 HTML 而非 JSON = 阿里云 WAF 挑战页（多为 cookie 未播种/失效时被拦），
+            // 重新播种 cookie 可恢复，标记为可重试而非致命 parse 错误
+            if (/(<!DOCTYPE|<html[\s>]|<script[\s>]|<!--)/i.test(text.slice(0, 512))) {
+              return { kind: 'waf', message: '雪球返回 WAF 挑战页（cookie 种子不完整，自动重试）', retryable: true }
+            }
+            return { kind: 'parse', message: '响应解析失败: ' + text.slice(0, 120), retryable: false }
+          }
           const cls = classifyError(data)
           if (cls) return { kind: cls.kind, message: cls.desc, code: cls.code, retryable: cls.retryable }
           // kline 陷阱：缺 u cookie 时返回 200 + 空 items 且无 column（静默失败）
@@ -230,9 +265,17 @@ return {
         if (!err.kind) return err.data
         if (!err.retryable || depth >= 2) throw new Error('[' + err.kind + '] ' + err.message)
 
-        if (err.kind === 'cookie_expired' || err.kind === 'empty' || err.kind === 'empty_kline') {
+        if (err.kind === 'cookie_expired' || err.kind === 'empty' || err.kind === 'empty_kline' || err.kind === 'waf') {
           if (err.kind === 'cookie_expired' && !anonymous && opts.cookie === undefined && login) {
             anonymous = true   // 登录 Cookie 被判失效：先降级匿名重试
+          }
+          if (err.kind === 'waf') {
+            // 播种昂贵（2 个种子 curl，最坏 2×12s）：只允许首轮且匿名路径触发，避免重试链撞穿 30s 看门狗；
+            // 带显式 cookie/登录态的请求直接抛错不重试：重播种出的匿名 cookie 用不上
+            if (depth > 0 || opts.cookie !== undefined || login) {
+              throw new Error('[waf] 雪球返回 WAF 挑战页（当前请求不适用重播种，请稍后再试）')
+            }
+            await delay(500)   // 稍等再播种，避免连续触发风控
           }
           await ensureCookie(true)   // 重新播种 cookie 后再试
         } else if (err.kind === 'rate_limited') {
@@ -351,7 +394,7 @@ return {
     // ---- actions ----
     async function actQuote(args) {
       const symbols = Array.isArray(args.symbols) ? args.symbols : [String(args.symbols || '')]
-      const list = symbols.filter(function (s) { return /^[A-Za-z0-9_.]+$/.test(s) })
+      const list = symbols.filter(function (s) { return /^[A-Za-z0-9_.]+$/.test(s) }).slice(0, 50)   // RPC 路径钳制（工具层另有 20 上限）
       if (!list.length) return { list: [], status: null }
       const data = await getJSON('/v5/stock/batch/quote.json', { symbol: list.join(',') }, { ttl: 10000 })
       const items = (data && data.data && data.data.items) || []
@@ -375,7 +418,10 @@ return {
       const PERIODS = { '1m': 1, '5m': 1, '15m': 1, '30m': 1, '60m': 1, 'day': 1, 'week': 1, 'month': 1 }
       const period = PERIODS[String(args.period)] ? String(args.period) : 'day'
       const count = Math.min(Math.max(parseInt(args.count, 10) || 120, 5), 500)
-      const symbol = String(args.symbol || '')
+      // 代码白名单：symbol 直接进 URL/shell 命令，剥除非白名单字符（含单引号）——
+      // 与 actQuote 的"拒绝"不同，这里是有意静默纠错（批量/单值输入容错，注入防御由 curl 层兜底）
+      const symbol = (String(args.symbol || '').match(/[A-Za-z0-9_.]/g) || []).join('').slice(0, 16)
+      if (!symbol) return { period: null, rows: [] }   // 剥除后为空（纯非法字符/缺参）：立即空结果，不进重试链
       // begin 按分钟取整，保证 TTL 窗口内缓存 key 稳定（count 为负，返回的是最近 N 根）。
       // args.begin（毫秒时间戳，通常传当前最早一根）：取该根往前的更早历史
       let begin = Math.floor(Date.now() / 60000) * 60000
@@ -383,7 +429,7 @@ return {
       const data = await getJSON('/v5/stock/chart/kline.json', {
         symbol: symbol, period: period, type: 'before', begin: begin,
         count: -count, indicator: 'kline,pe,pb,ps,pcf,market_capital'
-      }, { ttl: period === 'day' ? 300000 : 30000 })
+      }, { ttl: (args.begin > 0) ? 0 : (period === 'day' ? 300000 : 30000) })   // 前插 begin 几乎不重复：零复用价值，不占缓存
       return mapKline(data)
     }
 
@@ -441,7 +487,7 @@ return {
       const items = (data && data.items) || []
       return {
         items: items.map(function (it) {
-          return { id: it.id, text: it.text, mark: it.mark, created_at: it.created_at, target: it.target, view_count: it.view_count, reply_count: it.reply_count }
+          return { id: it.id, text: String(it.text || '').slice(0, 200), mark: it.mark, created_at: it.created_at, target: it.target, view_count: it.view_count, reply_count: it.reply_count }
         })
       }
     }
@@ -515,12 +561,26 @@ return {
       if (!root) return null
       try { return await fs.readText(await fs.resolve(name, { cwd: root })) } catch (e) { return null }
     }
-    // 写：稳定模式写稳定目录；否则旧工作区。返回真实落点（排障暴露用）
+    // 写：稳定模式写稳定目录；否则旧工作区。返回真实落点（排障暴露用）。
+    // fs 服务无原子 rename 原语，writeText 中途崩溃会留下半截 JSON（下次加载静默回退默认）；
+    // 主文件写成功后再写一份 .bak——读侧 parse 失败时回退 .bak，最坏丢"最后一次写"而非全部。
     async function stateWrite(name, text, fs, root) {
       const dir = await stateBase(fs, root)
-      const target = await fs.resolve(dir ? dir + '/' + name : name, { cwd: root })
+      const base = dir ? dir + '/' + name : name
+      const target = await fs.resolve(base, { cwd: root })
       await fs.writeText(target, text)
+      try { await fs.writeText(await fs.resolve(base + '.bak', { cwd: root }), text) } catch (e) { /* bak 尽力而为 */ }
       return target
+    }
+    // 读 JSON：主文件 parse 失败（半截写损坏）时回退 .bak；两者皆败返回 null
+    async function stateReadJson(name, fs, root) {
+      const read = async function (n) {
+        try { return JSON.parse(await stateRead(n, fs, root)) } catch (e) { return undefined }
+      }
+      const main = await read(name)
+      if (main !== undefined) return main
+      const bak = await read(name + '.bak')
+      return bak !== undefined ? bak : null
     }
 
     // ---- watchlist ----
@@ -532,10 +592,12 @@ return {
       const root = sp && sp.workspaceRoot ? sp.workspaceRoot : null
       if (fs) {
         try {
-          const text = await stateRead('.xueqiu-watchlist.json', fs, root)
-          const parsed = text == null ? null : JSON.parse(text)
+          const parsed = await stateReadJson('.xueqiu-watchlist.json', fs, root)
           if (parsed && Array.isArray(parsed.symbols) && parsed.symbols.length) {
-            watchlist = { symbols: parsed.symbols.slice(0, 200), lastSyncAt: Number(parsed.lastSyncAt) || 0 }
+            // 仅在仍是"默认占位"时采用文件值：读取在途期间的并发 add 不被旧文件覆盖
+            if (watchlist.symbols.length === DEFAULT_WATCHLIST.length && watchlist.symbols.every(function (s, i) { return s === DEFAULT_WATCHLIST[i] })) {
+              watchlist = { symbols: parsed.symbols.slice(0, 200), lastSyncAt: Number(parsed.lastSyncAt) || 0 }
+            }
           }
         } catch (e) { /* 首次运行或无写权限时使用默认列表 */ }
       }
@@ -593,6 +655,13 @@ return {
         await saveWatchlist()
         return changed
       } catch (e) {
+        // 失败同样推进 lastSyncAt：cookie 过期/断网时若节流不动，watchlist.get 每 20-30s
+        // 触发一次失败链（每次 3 个上游请求），日积月累形成无效请求风暴甚至触发 IP 风控
+        try {
+          wl.lastSyncAt = Date.now()
+          watchlist = wl
+          await saveWatchlist()
+        } catch (e2) { /* 落盘失败不影响内存节流 */ }
         return false   // 静默：debug RPC 可观察 login/cookie 状态
       } finally {
         syncInflight = false
@@ -603,6 +672,7 @@ return {
       const symbol = String(args.symbol || '')
       if (!/^[A-Za-z0-9_.]+$/.test(symbol)) throw new Error('无效代码: ' + symbol)
       const wl = await loadWatchlist()
+      if (wl.symbols.length >= 200) throw new Error('自选已达上限 200，请先删除部分代码')
       if (wl.symbols.indexOf(symbol) === -1) {
         wl.symbols.push(symbol)
         await saveWatchlist()
@@ -681,27 +751,37 @@ return {
       } catch (e) { return null }
     }
 
+    let revoked = false   // 注销进行中哨兵：阻止并发 loadLogin 从未覆盖的旧文件读回身份
     async function loadLogin() {
+      if (revoked) return null   // 注销毫秒窗内不读盘
       if (login !== null) return login
       const fs = ctx.get('fs')
       const sp = ctx.get('sandboxPolicy')
       const root = sp && sp.workspaceRoot ? sp.workspaceRoot : null
       if (fs) {
         try {
-          const text = await stateRead('.xueqiu-login.json', fs, root)
-          const parsed = text == null ? null : JSON.parse(text)
-          if (parsed && parsed.cookie && /xq_a_token=/.test(parsed.cookie)) login = parsed
+          const parsed = await stateReadJson('.xueqiu-login.json', fs, root)
+          // 仅首次赋值：stateRead 在途期间用户可能已 logout(置 null) 或 save(新 cookie)，
+          // 迟到的文件内容不得覆盖更新的内存态（防"已注销又被复活"）
+          if (parsed && parsed.cookie && /xq_a_token=/.test(parsed.cookie) && login === null) {
+            login = parsed
+            cache.clear()   // null→登录态同为身份切换：匿名期缓存不得跨身份复用（与 save/logout 对齐）
+          }
         } catch (e) { /* 未登录 */ }
       }
       return login
     }
 
     async function saveLogin() {
+      // 走 stateWrite 而非直写：登录文件是三份状态里丢失代价最高的（需重新粘贴 Cookie），
+      // 必须享受与 watchlist/ui 相同的 .bak 损坏兜底
       const fs = ctx.get('fs')
+      const sp = ctx.get('sandboxPolicy')
+      const root = sp && sp.workspaceRoot ? sp.workspaceRoot : null
       const target = await loginFilePath()
       if (!fs || !target) return
       try {
-        await fs.writeText(target, JSON.stringify(login || {}))
+        await stateWrite('.xueqiu-login.json', JSON.stringify(login || {}), fs, root)
       } catch (e) { /* 保持内存态 */ }
     }
 
@@ -757,7 +837,10 @@ return {
 
     async function actLoginStatus() {
       const lg = await loadLogin()
-      const path = await loginFilePath()
+      // 真实 fs.resolve 返回 {targetKey, displayPath} 对象（mock 返回字符串）：
+      // 暴露给 UI 的排障字段统一取 displayPath 并 String 兜底，保证两种运行时都是可读字符串
+      const resolved = await loginFilePath()
+      const path = resolved == null ? null : String((resolved && typeof resolved === 'object' && resolved.displayPath) ? resolved.displayPath : resolved)
       if (!lg) return { loggedIn: false, path: path }
       // 本地 JWT 过期预检：过期则提示重登（不自动清除，等用户确认）
       let expired = false
@@ -803,6 +886,7 @@ return {
       if (cls) throw new Error('Cookie 校验失败 [' + cls.code + ']: ' + cls.desc + '（请确认浏览器处于登录状态后重新复制）')
       login = { cookie: cookie, uid: uid, screenName: screenName, savedAt: Date.now() }
       cloudPid = null
+      cache.clear()   // 身份切换：匿名期缓存的登录态专属数据（云端自选/财务字段）必须失效
       await saveLogin()
       // 登录成功即强制同步一次云端自选（云端为准镜像；失败不阻塞登录）
       let symbols = null
@@ -814,9 +898,15 @@ return {
     }
 
     async function actLoginLogout() {
+      // 顺序：先落盘 {} 再清内存。若先置 null，saveLogin 两次写盘完成前的毫秒窗内并发
+      // loadLogin（login===null 永远重读文件）会把旧文件里的 cookie 读回内存——已注销身份复活
+      cache.clear()   // 缓存 key 不含登录维度：切换身份后旧数据（含 24h TTL 的财务）必须全量失效
+      const prev = login
       login = null
       cloudPid = null
-      await saveLogin()   // 写入 {} 清空
+      revoked = true   // 注销哨兵：loadLogin 见此短路，杜绝读盘竞态复活
+      try { await saveLogin() } catch (e) { login = prev; revoked = false; throw e }
+      revoked = false
       return { loggedIn: false }
     }
 
@@ -841,8 +931,7 @@ return {
       const root = sp && sp.workspaceRoot ? sp.workspaceRoot : null
       if (fs) {
         try {
-          const text = await stateRead('.xueqiu-ui-state.json', fs, root)
-          const parsed = text == null ? null : JSON.parse(text)
+          const parsed = await stateReadJson('.xueqiu-ui-state.json', fs, root)
           if (parsed && typeof parsed === 'object') uiState = parsed
         } catch (e) { /* 默认状态 */ }
       }
@@ -920,7 +1009,11 @@ return {
       const reqObj = (req && typeof req === 'object') ? req : {}
       const action = reqObj.action
       const args = reqObj.args || {}
-      if (!dispatch[action]) return { ok: false, error: '未知操作: ' + action }
+      // hasOwnProperty 检查：action 传 'constructor'/'toString' 等 Object.prototype 键时
+      // 旧写法 if (!dispatch[action]) 会命中原型上的真值函数，未知操作契约被绕过
+      if (!Object.prototype.hasOwnProperty.call(dispatch, action) || typeof dispatch[action] !== 'function') {
+        return { ok: false, error: '未知操作: ' + action }
+      }
       try {
         const data = await dispatch[action](args)
         return { ok: true, data: sanitize(data) }

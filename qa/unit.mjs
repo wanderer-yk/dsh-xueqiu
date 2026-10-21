@@ -17,13 +17,18 @@ function scriptShell(scripts) {
   return {
     calls,
     resolve: (s) => s,
-    run: async (spec) => {
+    // 对齐真实 DSH v24.16：只有 execute（句柄+result），生产必经分支在全部断言下覆盖；
+    // 旧 run 兼容分支由本文件内联的 shell2/hungShell（仍用 run）覆盖
+    execute: async (spec) => {
       const url = (spec.command.match(/'(https:[^']+)'/) || [])[1] || spec.command
-      calls.push({ url, at: Date.now(), cmd: spec.command })
+      calls.push({ url, at: Date.now(), cmd: spec.command, stdin: spec.stdin })
       const hit = scripts.find((s) => url.includes(s.match))
-      if (!hit) return { exitCode: 0, stdout: { text: '' }, stderr: { text: '' } }  // 空响应
-      if (hit.throws) return { exitCode: 1, stdout: { text: '' }, stderr: { text: 'boom' } }
-      return { exitCode: 0, stdout: { text: typeof hit.body === 'function' ? hit.body(url, calls.length) : hit.body }, stderr: { text: '' } }
+      const out = !hit
+        ? { exitCode: 0, stdout: { text: '' }, stderr: { text: '' } }  // 空响应
+        : hit.throws
+          ? { exitCode: 1, stdout: { text: '' }, stderr: { text: 'boom' } }
+          : { exitCode: 0, stdout: { text: typeof hit.body === 'function' ? hit.body(url, calls.length) : hit.body }, stderr: { text: '' } }
+      return { result: async () => out }
     },
   }
 }
@@ -90,10 +95,95 @@ console.log('== U1 调度与缓存 ==')
   ok(r.ok && r.data.list[0].current === 5, 'network 错误重试一次后成功')
 }
 {
-  // 重试链：parse 错误不可重试
-  const { call, shell } = await fresh([{ match: 'batch/quote', body: '<html>not json' }])
+  // 重试链：纯垃圾文本（非 HTML）报 [parse] 且不重试
+  const { call, shell } = await fresh([{ match: 'batch/quote', body: 'not json at all' }])
   const r = await call('quote', { symbols: 'SH600519' })
-  ok(!r.ok && /parse/.test(r.error), '非 JSON 响应报 [parse] 且不重试 (请求次数=' + shell.calls.length + ')')
+  ok(!r.ok && /parse/.test(r.error), '非 JSON 非 HTML 响应报 [parse] 且不重试 (请求次数=' + shell.calls.length + ')')
+}
+{
+  // waf 自愈：HTML 挑战页 → 重新播种 cookie 后重试成功（v1.22.16 行为变更，原为 [parse] 不重试）
+  let n = 0
+  const { call, shell } = await fresh([{ match: 'batch/quote', body: () => (n++ === 0 ? '<!DOCTYPE html><html><head>acw_sc</head></html>' : quoteBody('SH600519', 9)) }])
+  const r = await call('quote', { symbols: 'SH600519' })
+  ok(r.ok && r.data.list[0].current === 9, 'WAF 挑战页自动重播种并重试成功')
+  ok(shell.calls.filter((c) => (c.cmd || '').includes('xueqiu.com/hq')).length >= 1, 'WAF 触发了 cookie 重播种')
+}
+{
+  // cookie 不进 argv：登录态请求的命令行不含 cookie 值，且使用 -H @- + spec.stdin
+  const { call, shell } = await fresh([{ match: 'batch/quote', body: quoteBody('SH600519', 1) }], { '.xueqiu-login.json': JSON.stringify({ cookie: 'xq_a_token=SECRET_TOKEN_9f; u=42' }) })
+  await call('watchlist.get', {})   // 触发 loadLogin 就绪（actQuote 不主动加载登录态）
+  await call('quote', { symbols: 'SH600519' })
+  const dataCmds = shell.calls.filter((c) => c.url.includes('batch/quote'))
+  ok(dataCmds.every((c) => !c.cmd.includes('SECRET_TOKEN_9f')), '登录 cookie 不出现在命令行（防 ps 泄漏）')
+  ok(dataCmds.every((c) => c.cmd.includes('-H @-')), 'cookie 经 stdin 注入（-H @-）')
+}
+{
+  // watchlist 200 上限：超限时 add 报错不再静默截断
+  const many = []
+  for (let i = 0; i < 200; i++) many.push('SH60' + String(100000 + i))
+  const { call } = await fresh(undefined, { '.xueqiu-watchlist.json': JSON.stringify({ symbols: many }) })
+  const r = await call('watchlist.add', { symbol: 'SH600519' })
+  ok(!r.ok && /上限/.test(r.error), 'watchlist 200 上限前置拦截')
+}
+{
+  // .bak 回退：主状态文件损坏（半截 JSON）时读 .bak 恢复
+  const { call } = await fresh(undefined, {
+    '.xueqiu-watchlist.json': '{"symbols":["SH6005",',
+    '.xueqiu-watchlist.json.bak': '{"symbols":["SH600519"]}',
+  })
+  const r = await call('watchlist.get', {})
+  ok(r.ok && r.data.symbols[0] === 'SH600519', '主文件半截损坏时回退 .bak（不回退默认列表）')
+}
+{
+  // 身份切换缓存失效三连之 loadLogin 首载：匿名缓存不得跨身份复用
+  const { call, shell } = await fresh([{ match: 'batch/quote', body: quoteBody('SH600519', 3) }], { '.xueqiu-login.json': JSON.stringify({ cookie: 'xq_a_token=FIRST_LOAD' }) })
+  await call('quote', { symbols: 'SH600519' })   // 匿名期进缓存（login 未加载）
+  await call('watchlist.get', {})                // 触发 loadLogin 首载（null→登录态，应 cache.clear）
+  await call('quote', { symbols: 'SH600519' })   // 应重新打上游
+  const ups = shell.calls.filter((c) => c.url.includes('batch/quote')).length
+  ok(ups === 2, 'loadLogin 首载清缓存（quote 上游=' + ups + '，期望 2）')
+}
+{
+  // 身份切换缓存失效三连之 logout：注销后缓存同样失效
+  const { call, shell } = await fresh([{ match: 'batch/quote', body: quoteBody('SH600519', 4) }], { '.xueqiu-login.json': JSON.stringify({ cookie: 'xq_a_token=BEFORE_OUT' }) })
+  await call('watchlist.get', {})
+  await call('quote', { symbols: 'SH600519' })
+  const r = await call('login.logout', {})
+  ok(r.ok && r.data.loggedIn === false, 'login.logout 成功返回')
+  await call('quote', { symbols: 'SH600519' })
+  const ups = shell.calls.filter((c) => c.url.includes('batch/quote')).length
+  ok(ups === 2, 'logout 清缓存（quote 上游=' + ups + '，期望 2）')
+}
+{
+  // login.save 成功全链路：校验通过 → 登录态生效 + .bak 伴生文件生成 + 缓存失效
+  const { call, shell, ctx } = await fresh([
+    { match: 'portfolio/list', body: '{"data":{"portfolios":[{"pid":-1,"name":"全部"}]}}' },
+    { match: 'batch/quote', body: quoteBody('SH600519', 5) },
+  ])
+  const cookie = 'Cookie: xq_a_token=NEWLOGIN; u=4242'
+  const r = await call('login.save', { cookie })
+  ok(r.ok && r.data.loggedIn === true, 'login.save 校验通过并生效')
+  ok(ctx.__files['.xueqiu-login.json'] && ctx.__files['.xueqiu-login.json'].includes('NEWLOGIN'), '登录文件写入')
+  ok(ctx.__files['.xueqiu-login.json.bak'] && ctx.__files['.xueqiu-login.json.bak'].includes('NEWLOGIN'), '登录 .bak 伴生文件生成（saveLogin 走 stateWrite）')
+  const cmds = shell.calls.filter((c) => c.url.includes('portfolio/list'))
+  ok(cmds.every((c) => !c.cmd.includes('NEWLOGIN') && (c.stdin || '').includes('Cookie: xq_a_token=NEWLOGIN')), '校验请求 cookie 走 stdin 且不进 argv')
+}
+{
+  // waf 与登录态并存：带登录态遇 WAF 直接抛错不重播种（不白打播种 curl）
+  const { call, shell } = await fresh([{ match: 'batch/quote', body: '<!DOCTYPE html><html>acw</html>' }], { '.xueqiu-login.json': JSON.stringify({ cookie: 'xq_a_token=UNDER_WAF' }) })
+  await call('watchlist.get', {})
+  const seedsBefore = shell.calls.filter((c) => /xueqiu\.com\/hq|www\.xueqiu\.com\/$/.test(c.url)).length   // watchlist.get 的云端同步可能自带播种（empty 链），以此为基线
+  const r = await call('quote', { symbols: 'SH600519' })
+  ok(!r.ok && /\[waf\]/.test(r.error), '登录态遇 WAF 报 [waf] 错误')
+  const seedsAfter = shell.calls.filter((c) => /xueqiu\.com\/hq|www\.xueqiu\.com\/$/.test(c.url)).length
+  ok(seedsAfter === seedsBefore, '登录态 WAF 不触发播种（增量=' + (seedsAfter - seedsBefore) + '，期望 0）')
+}
+{
+  // actKline 空 symbol（纯非法字符剥除后为空）：立即空结果，不发上游请求
+  const { call, shell } = await fresh([{ match: 'kline', body: '{"data":{}}' }])
+  const r = await call('kline', { symbol: '!!!', period: 'day' })
+  ok(r.ok && Array.isArray(r.data.rows) && r.data.rows.length === 0, 'kline 空 symbol 返回结构化空结果')
+  ok(shell.calls.filter((c) => (c.url || '').includes('kline.json')).length === 0, '空 symbol 不发起上游 kline 请求')
 }
 {
   // cookie_expired 降级：登录态 400016 → 匿名重试
@@ -279,6 +369,10 @@ console.log('== U6 RPC 分发与安全 ==')
   const { call } = await fresh([{ match: 'batch/quote', body: quoteBody('SH600519', 1) }])
   const r = await call('nonsense', {})
   ok(!r.ok && /未知操作/.test(r.error), '未知 action 返回结构化错误')
+  const proto = await call('constructor', { foo: 1 })
+  ok(!proto.ok && /未知操作/.test(proto.error), '原型键(constructor)不绕过 dispatch 白名单')
+  const ts = await call('toString', {})
+  ok(!ts.ok && /未知操作/.test(ts.error), '原型键(toString)不绕过 dispatch 白名单')
   // quote 过滤非法 symbol
   const r2 = await call('quote', { symbols: 'SH600519,evil$code,00700' })
   ok(r2.ok, 'quote 混入非法代码不崩')

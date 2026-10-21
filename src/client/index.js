@@ -220,7 +220,27 @@ exports.default = {
     function el(type, props, children) { return React.createElement(type, props, children) }
 
     async function call(action, args) {
-      const r = await fetch('/xq-rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action, args: args || {} }) }).then(function (res) { return res.json() })
+      // 超时 + 状态检查：host 卡住时不能让面板永久假死；非 JSON/5xx 给可读错误
+      // AbortSignal.timeout 需 Chrome 103+/Safari 16+；老 WebView 缺失时退回 race 看门狗（不能永挂也不能全挂）
+      let res
+      if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+        try {
+          res = await fetch('/xq-rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action, args: args || {} }), signal: AbortSignal.timeout(15000) })
+        } catch (e) {
+          if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) throw new Error('请求超时 (15s)')
+          throw e
+        }
+      } else {
+        let t
+        const watchdog = new Promise(function (_, rej) { t = setTimeout(function () { rej(new Error('请求超时 (15s)')) }, 15000) })
+        res = await Promise.race([
+          fetch('/xq-rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action, args: args || {} }) }),
+          watchdog
+        ]).finally(function () { clearTimeout(t) })
+      }
+      if (!res.ok) throw new Error('请求失败 (HTTP ' + res.status + ')')
+      let r
+      try { r = await res.json() } catch (e) { throw new Error('响应不是有效 JSON（host 异常）') }
       if (!r || !r.ok) throw new Error((r && r.error) || '调用失败')
       return r.data
     }
@@ -771,13 +791,16 @@ exports.default = {
       const tab = ui.tab
       function setTab(t) { ui.set({ tab: t }) }
 
+      const mktSeq = React.useRef(0)   // 行情响应序号：慢响应晚到时丢弃，防旧数据覆盖新结果
       function refreshMarket() {
+        const seq = ++mktSeq.current
         return Promise.all([
           call('watchlist.get', {}),
           call('quote', { symbols: ['SH000001', 'SZ399001', 'SZ399006', 'SH000688'] })
         ]).then(function (res) {
           const wl = (res[0] && res[0].symbols) || []
           const status = res[1] ? res[1].status : null
+          if (seq !== mktSeq.current) return   // 已有更新的行情响应落地，丢弃本次
           setMarketOpen(status === 5 || status === 6)
           setWatchlist(wl)
           setIndices((res[1] && res[1].list) || [])
@@ -797,10 +820,12 @@ exports.default = {
               if (prev !== undefined && q.current !== prev) dirs[q.symbol] = q.current > prev ? 1 : -1
               prevPrices.current[q.symbol] = q.current
             })
+            if (seq !== mktSeq.current) return   // 批量行情慢于下一轮轮询时同样丢弃
             if (Object.keys(dirs).length) setFlashDir(dirs)
             setQuotes(list.concat(missing))
           })
         }).catch(function (e) {
+          if (seq !== mktSeq.current) return   // 过期响应的失败不得覆盖新一轮的状态/错误
           setErr(String((e && e.message) || e))
         })
       }
@@ -834,7 +859,7 @@ exports.default = {
           news.forEach(function (it) { seen[it.id] = true })
           const fresh = items.filter(function (it) { return !seen[it.id] })
           if (!fresh.length) setNewsNoMore(true)
-          else setNews(news.concat(fresh))
+          else setNews(news.concat(fresh).slice(-500))   // 翻页上限 500 条：防长翻页无上限累积（60s 轮询重置兜底外的第二道闸）
           setNewsMore(false)
         }).catch(function () {
           setNewsMore(false)
@@ -868,14 +893,24 @@ exports.default = {
 
       // K线历史获取（纯函数，不碰 React 状态）：图表右拖触底时拉更早的 500 根，返回原始行；
       // 图表内部自行前插持有全部历史，React 缓冲始终只是初始窗口（避免双数据源互相反馈）。
+      const earlierPages = React.useRef(0)   // 前插页数封顶：10×500=5000 根，防无上限拖拽驻留（切周期/换标 key remount 自动重置）
       function fetchEarlierKline(earliestTs) {
         if (!view || !detail || !detail.kline) return []
+        if (earlierPages.current >= 10) return []
         const cur = detail.kline.rows || []
-        const begin = earliestTs || (cur.length ? cur[0].timestamp : 0)
-        if (!begin) return []
-        // 以当前最早一根为 begin 的近似：多拉 500 根（count 负值=含 begin 往前），host 侧 type:'before' 返回区间
+        const raw = earliestTs || (cur.length ? cur[0].timestamp : 0)
+        if (!raw) return []
+        // begin 回退一个安全步长：上游实测（2026-10 判别）为 inclusive 语义——返回 timestamp ≤ begin
+        // 的最近 N 根。begin=raw 也能工作（raw 本身被客户端 timestamp < 过滤），回退步长只为
+        // 防上游语义漂移时 add 为空导致 forward:false 截断。步长必须 ≤ 相邻 bar 最小间隔，
+        // 否则漏 bar：day/week/分钟线间隔恒定取一个周期；month 的"当月未收线 bar"锚点实时
+        // 滚动，实测与上一根 gap 可小至 21 天，故取 20 天（< 任何可能 gap）
+        const STEP = { '1m': 6e4, '5m': 3e5, '15m': 9e5, '30m': 18e5, '60m': 36e5, day: 864e5, week: 6048e5, month: 1728e6 }
+        const begin = Math.max(0, raw - (STEP[klinePeriod] || 864e5))
         return call('kline', { symbol: view, period: klinePeriod, count: 500, begin: begin }).then(function (res) {
-          return (res && res.rows) || []
+          const rows = (res && res.rows) || []
+          if (rows.length) earlierPages.current++
+          return rows
         }).catch(function () { return [] /* 追加失败静默：图表仍可看已有缓冲 */ })
       }
 
@@ -1679,7 +1714,9 @@ exports.default = {
         className: 'xq-badge',
         style: style,
         title: '点击开合行情面板 · 拖动调整位置 · 右下角 ⤡ 调宽度（双击复位）',
-        onPointerDown: onDown, onPointerMove: onMove, onPointerUp: onUp, onPointerCancel: onUp
+        onPointerDown: onDown, onPointerMove: onMove, onPointerUp: onUp,
+        // 触屏被系统手势抢占时只清理复位：误走 onUp 的 !moved 分支会 toggle 面板开合
+        onPointerCancel: function () { badgeDrag = null; badgeMoved = false }
       }, [
         el('div', { key: 'hd', className: 'xq-badge-hd' }, [
           el('span', { key: 'logo' }, [el('b', { key: 'b' }, '雪球'), 'mini']),
@@ -1802,8 +1839,29 @@ exports.default = {
           el('span', { key: 'g', className: 'xq-tv-pct ' + (chgPct > 0 ? 'xq-up' : chgPct < 0 ? 'xq-down' : ''), style: { marginLeft: 'auto' } },
             fmt(last.close) + '  ' + (chgPct >= 0 ? '+' : '') + chgPct.toFixed(2) + '%')
         ]),
-        el(KlineChart, { key: 'c' + rows.length, symbol: String(r.symbol || ''), rows: rows })
+        el(LazyKline, { key: 'c' + rows.length, symbol: String(r.symbol || ''), rows: rows })
       ])
+    }
+
+    // R1 修复：工具卡片是会话消息的一部分，GUI 不卸载历史消息——每卡一个 canvas（DPR2 下 ~3.4MB）
+    // 随对话线性累积。离屏时卸载图表换占位（canvas/实例释放），回视口重挂；首屏卡片保持即挂。
+    function LazyKline(props) {
+      const wrap = React.useRef(null)
+      const [visible, setVisible] = React.useState(true)   // 首屏乐观挂载，IntersectionObserver 到位后校正
+      React.useEffect(function () {
+        const node = wrap.current
+        if (!node || typeof IntersectionObserver === 'undefined') return
+        const io = new IntersectionObserver(function (es) {
+          setVisible(es[0] && es[0].isIntersecting)
+        }, { rootMargin: '200px' })
+        io.observe(node)
+        return function () { io.disconnect() }
+      }, [])
+      return el('div', { ref: wrap, className: 'xq-klc-lazy', style: { minHeight: visible ? 0 : '120px' } },
+        visible
+          ? el(KlineChart, { symbol: props.symbol, rows: props.rows })
+          : el('div', { className: 'xq-klc-ph', style: { display: 'flex', alignItems: 'center', justifyContent: 'center', height: '120px', color: 'var(--dsw-alias-label-tertiary)', fontSize: '12px' } },
+              '↕ 图表已休眠（滚入视口自动恢复）'))
     }
 
     function HotCard(props) {
