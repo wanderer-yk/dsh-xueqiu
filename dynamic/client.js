@@ -188,6 +188,53 @@ return {
 
     function el(type, props, children) { return React.createElement(type, props, children) }
 
+    // ---- 指数轮询共享层：面板(20s)/徽章(30s)/指数条(30s) 三组件合并为单请求流 ----
+    // 收益：同一组 4 指数的上游请求从每 20-30s ×3 份降为每 20s ×1 份（host 的 10s TTL 恰好不命中，
+    // 合并前三组件各自真实打满上游）。语义保持：页面隐藏暂停、回前台立即刷新（5s 节流防抖）、
+    // in-flight 去重（多订阅者同时回前台只打一次）、卸载退订（最后一个退订停表）。
+    const indexPoll = { subs: new Set(), timer: null, data: null, status: null, at: 0, inflight: null, visOn: false }
+    const INDEX_SYMBOLS = ['SH000001', 'SZ399001', 'SZ399006', 'SH000688']
+    function indexPollFetch() {
+      if (indexPoll.inflight) return indexPoll.inflight
+      indexPoll.inflight = call('quote', { symbols: INDEX_SYMBOLS }).then(function (data) {
+        indexPoll.data = (data && data.list) || []
+        indexPoll.status = data ? data.status : null
+        indexPoll.at = Date.now()
+        indexPoll.subs.forEach(function (fn) { try { fn(indexPoll.data, indexPoll.status) } catch (e) { /* 单个订阅者异常不殃及池 */ } })
+      }).catch(function () { /* 静默：保留上次数据，下个 tick 重试 */ }).then(function () { indexPoll.inflight = null })
+      return indexPoll.inflight
+    }
+    function indexPollTick() {
+      if (!indexPoll.subs.size || pageHidden()) return
+      indexPollFetch()
+    }
+    function indexPollVis() {
+      if (!pageHidden() && indexPoll.subs.size && Date.now() - indexPoll.at > 5000) indexPollFetch()
+    }
+    function subscribeIndices(fn) {
+      const first = indexPoll.subs.size === 0
+      indexPoll.subs.add(fn)
+      if (indexPoll.data) { try { fn(indexPoll.data, indexPoll.status) } catch (e) { /* ignore */ } }   // 新订阅者立即回放缓存
+      if (first) {
+        if (!indexPoll.at || Date.now() - indexPoll.at > 20000) indexPollFetch()
+        if (!indexPoll.timer) indexPoll.timer = ctx.interval(indexPollTick, 20000)
+        if (!indexPoll.visOn) {
+          indexPoll.visOn = true
+          try { document.addEventListener('visibilitychange', indexPollVis) } catch (e) { /* ignore */ }
+        }
+      }
+      return function () {
+        indexPoll.subs.delete(fn)
+        if (!indexPoll.subs.size) {
+          if (indexPoll.timer) { indexPoll.timer(); indexPoll.timer = null }
+          if (indexPoll.visOn) {
+            indexPoll.visOn = false
+            try { document.removeEventListener('visibilitychange', indexPollVis) } catch (e) { /* ignore */ }
+          }
+        }
+      }
+    }
+
     async function call(action, args) {
       // host.call 无内建超时：race 15s 看门狗，host 卡住时面板不能永久假死
       let t
@@ -746,18 +793,20 @@ return {
       function setTab(t) { ui.set({ tab: t }) }
 
       const mktSeq = React.useRef(0)   // 行情响应序号：慢响应晚到时丢弃，防旧数据覆盖新结果
+      // 指数与开闭市状态接共享轮询层（原与 watchlist/自选混在一个 Promise.all）：
+      // 三组件同源合一，且共享层数据恒为最新缓存、无慢响应覆盖竞态（mktSeq 只需守护自选链）
+      React.useEffect(function () {
+        return subscribeIndices(function (list, status) {
+          setIndices(list)
+          setMarketOpen(status === 5 || status === 6)
+        })
+      }, [])
       function refreshMarket() {
         const seq = ++mktSeq.current
-        return Promise.all([
-          call('watchlist.get', {}),
-          call('quote', { symbols: ['SH000001', 'SZ399001', 'SZ399006', 'SH000688'] })
-        ]).then(function (res) {
-          const wl = (res[0] && res[0].symbols) || []
-          const status = res[1] ? res[1].status : null
+        return call('watchlist.get', {}).then(function (wl0) {
+          const wl = (wl0 && wl0.symbols) || []
           if (seq !== mktSeq.current) return   // 已有更新的行情响应落地，丢弃本次
-          setMarketOpen(status === 5 || status === 6)
           setWatchlist(wl)
-          setIndices((res[1] && res[1].list) || [])
           setErr('')
           if (!wl.length) return
           return call('quote', { symbols: wl }).then(function (data) {
@@ -1503,14 +1552,14 @@ return {
 
       React.useEffect(function () {
         let alive = true
+        // 指数部分接共享轮询层（原 30s 自有；面板/指数条同源，三合一省 2/3 上游请求）
+        const offIdx = subscribeIndices(function (list, status) {
+          if (!alive) return
+          setIdx(list)
+          setMOpen(status === 5 || status === 6)
+        })
         function refresh() {
           if (pageHidden()) return   // 页面隐藏时暂停徽章轮询
-          call('quote', { symbols: ['SH000001', 'SZ399001', 'SZ399006', 'SH000688'] }).then(function (data) {
-            if (!alive) return
-            setIdx((data && data.list) || [])
-            const st = data ? data.status : null
-            setMOpen(st === 5 || st === 6)
-          }).catch(function () { /* 静默失败 */ })
           // 徽章主体：自选前 12 只（轮动素材 / 平铺内容）；自选为空回退指数
           call('watchlist.get', {}).then(function (wl) {
             if (!alive) return
@@ -1527,7 +1576,7 @@ return {
         const off = ui.subscribe(function () { force(function (x) { return x + 1 }) })
         try { document.addEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
         return function () {
-          alive = false; if (stop) stop(); off()
+          alive = false; if (stop) stop(); if (offIdx) offIdx(); off()
           try { document.removeEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
         }
       }, [])
@@ -1693,21 +1742,8 @@ return {
     function Ticker() {
       const [indices, setIndices] = React.useState([])
       React.useEffect(function () {
-        let alive = true
-        function refresh() {
-          if (pageHidden()) return   // 页面隐藏时暂停指数条轮询
-          call('quote', { symbols: ['SH000001', 'SZ399001', 'SZ399006', 'SH000688'] }).then(function (data) {
-            if (alive) setIndices((data && data.list) || [])
-          }).catch(function () { /* 静默失败 */ })
-        }
-        function onVis() { if (!pageHidden()) refresh() }
-        refresh()
-        const stop = ctx.interval(refresh, 30000)
-        try { document.addEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
-        return function () {
-          alive = false; if (stop) stop()
-          try { document.removeEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
-        }
+        // 指数条接入共享轮询层（原 30s 自有轮询；隐藏暂停/回前台刷新由共享层统一处理）
+        return subscribeIndices(function (list) { setIndices(list) })
       }, [])
       if (!indices.length) return null
       const kids = indices.map(function (q) {

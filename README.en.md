@@ -135,6 +135,9 @@ The data layer is defended in depth — safe to leave open for hours:
 
 ## Changelog
 
+- **1.23.0** (2026-10-21)
+  - Perf: **index polling 3-to-1** — the panel (20s), badge (30s), and ticker (30s) polled the same 4 indices independently; now merged into a single request stream (module-level shared layer: one 20s timer + subscriber replay + in-flight dedup + hidden-pause with 5s-throttled foreground refresh). Upstream index requests drop by two-thirds; the shared cache always serves the freshest data, eliminating the slow-response overwrite race (mktSeq now guards only the watchlist chain).
+
 - **1.22.17** (2026-10-21)
   - Hardening: login credential file auto-`chmod 600` after write (fs lacks a permission primitive; via shell, non-blocking on failure); `actQuote` returns an explicit `truncated` count.
   - Fix: `fmtTime` accepts string timestamps and renders `--:--:--` on invalid input (was NaN:NaN:NaN); a failed stable-dir probe no longer caches the fallback forever; the probe file no longer stores timestamp data.
