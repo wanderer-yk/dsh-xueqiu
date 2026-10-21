@@ -28,6 +28,12 @@ jobs:
         run: |
           node qa/unit.mjs
           node qa/cookie.mjs
+          node qa/edge.mjs
+          node qa/regress-v1228.mjs
+          node qa/persist-upgrade.mjs
+          node qa/state-paths.mjs
+          node qa/vol-units.mjs
+          node qa/fence.mjs
       - name: Static install smoke (real user path)
         run: bash scripts/static-smoke.sh
         env:
@@ -69,6 +75,12 @@ jobs:
         run: |
           node qa/unit.mjs
           node qa/cookie.mjs
+          node qa/edge.mjs
+          node qa/regress-v1228.mjs
+          node qa/persist-upgrade.mjs
+          node qa/state-paths.mjs
+          node qa/vol-units.mjs
+          node qa/fence.mjs
       - name: Live API test via pwsh shell (real Xueqiu, anonymous)
         run: node qa/live.mjs
       # 真 Win10 老用户环境：DSH win32 层在无 pwsh 7 时回退 powershell.exe(5.1)。

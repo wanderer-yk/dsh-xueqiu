@@ -281,7 +281,9 @@ exports.default = {
     }
     function fmtTime(ts) {
       if (!ts) return ''
-      const d = new Date(Number(ts))
+      // 兼容毫秒数字与可解析字符串（NewsTab created_at 两形态）；无效输入显示 '--' 而非 NaN:NaN:NaN
+      const d = new Date(typeof ts === 'number' ? ts : /^\d+$/.test(String(ts)) ? Number(ts) : Date.parse(ts))
+      if (isNaN(d.getTime())) return '--:--:--'
       function p(n) { return n < 10 ? '0' + n : String(n) }
       return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds())
     }
@@ -1793,7 +1795,8 @@ exports.default = {
 
     function QuoteCard(props) {
       const block = props.block
-      const r = xqParseResult(block)
+      // useMemo：父级流式更新触发重渲染时跳过重复 JSON.parse（block 引用未变即命中缓存）
+      const r = React.useMemo(function () { return xqParseResult(block) }, [block])
       if (!r) return el('div', { className: 'xq-tv-shell' }, block && block.kind ? '结果不可读' : '查询中…')
       const list = Array.isArray(r.list) ? r.list : []
       if (!list.length) return el('div', { className: 'xq-tv-shell' }, '无行情数据（检查代码，或先用 xueqiu_search 查代码）')
@@ -1820,7 +1823,8 @@ exports.default = {
 
     function KlineCard(props) {
       const block = props.block
-      const r = xqParseResult(block)
+      // useMemo：父级流式更新触发重渲染时跳过重复 JSON.parse（block 引用未变即命中缓存）
+      const r = React.useMemo(function () { return xqParseResult(block) }, [block])
       if (!r) return el('div', { className: 'xq-tv-shell' }, block && block.kind ? '结果不可读' : '查询中…')
       if (r.error) return el('div', { className: 'xq-tv-shell' }, String(r.error))
       const rows = Array.isArray(r.rows) ? r.rows : []
@@ -1866,7 +1870,8 @@ exports.default = {
 
     function HotCard(props) {
       const block = props.block
-      const r = xqParseResult(block)
+      // useMemo：父级流式更新触发重渲染时跳过重复 JSON.parse（block 引用未变即命中缓存）
+      const r = React.useMemo(function () { return xqParseResult(block) }, [block])
       if (!r) return el('div', { className: 'xq-tv-shell' }, block && block.kind ? '结果不可读' : '查询中…')
       const list = Array.isArray(r.list) ? r.list : []
       if (!list.length) return el('div', { className: 'xq-tv-shell' }, '无热榜数据')
@@ -1898,7 +1903,8 @@ exports.default = {
 
     function NewsCard(props) {
       const block = props.block
-      const r = xqParseResult(block)
+      // useMemo：父级流式更新触发重渲染时跳过重复 JSON.parse（block 引用未变即命中缓存）
+      const r = React.useMemo(function () { return xqParseResult(block) }, [block])
       if (!r) return el('div', { className: 'xq-tv-shell' }, block && block.kind ? '结果不可读' : '查询中…')
       const items = Array.isArray(r.items) ? r.items : []
       if (!items.length) return el('div', { className: 'xq-tv-shell' }, '无快讯')

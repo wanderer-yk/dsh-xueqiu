@@ -179,6 +179,24 @@ console.log('== U1 调度与缓存 ==')
   ok(seedsAfter === seedsBefore, '登录态 WAF 不触发播种（增量=' + (seedsAfter - seedsBefore) + '，期望 0）')
 }
 {
+  // 登录凭证权限收紧：saveLogin 落盘后发出 chmod 600（有 shell 且 fs 提供 processPath 时）
+  const { call, shell } = await fresh([
+    { match: 'portfolio/list', body: '{"data":{"portfolios":[{"pid":-1}]}}' },
+  ])
+  await call('login.save', { cookie: 'Cookie: xq_a_token=CHMODME; u=1' })
+  const chmods = shell.calls.filter((c) => /chmod 600/.test(c.cmd))
+  ok(chmods.length >= 1, '登录文件写入后发出 chmod 600（calls=' + chmods.length + '）')
+  ok(chmods.every((c) => c.cmd.includes('.xueqiu-login.json')), 'chmod 目标是登录文件')
+}
+{
+  // actQuote 截断提示：超量符号返回 truncated 计数字段
+  const syms = []
+  for (let i = 0; i < 55; i++) syms.push('SH6000' + (100 + i))
+  const { call } = await fresh([{ match: 'batch/quote', body: quoteBody('SH6000100', 1) }])
+  const r = await call('quote', { symbols: syms })
+  ok(r.ok && r.data.truncated === 5, 'actQuote 超量 55→50 返回 truncated=5')
+}
+{
   // actKline 空 symbol（纯非法字符剥除后为空）：立即空结果，不发上游请求
   const { call, shell } = await fresh([{ match: 'kline', body: '{"data":{}}' }])
   const r = await call('kline', { symbol: '!!!', period: 'day' })

@@ -135,6 +135,12 @@ The data layer is defended in depth — safe to leave open for hours:
 
 ## Changelog
 
+- **1.22.17** (2026-10-21)
+  - Hardening: login credential file auto-`chmod 600` after write (fs lacks a permission primitive; via shell, non-blocking on failure); `actQuote` returns an explicit `truncated` count.
+  - Fix: `fmtTime` accepts string timestamps and renders `--:--:--` on invalid input (was NaN:NaN:NaN); a failed stable-dir probe no longer caches the fallback forever; the probe file no longer stores timestamp data.
+  - Perf: the four tool cards wrap `xqParseResult` in `useMemo`, skipping repeated JSON.parse on streaming re-renders.
+  - Tests: CI offline matrix expanded to all 8 suites (346 assertions previously local-only); new chmod/truncated cases (unit 61).
+
 - **1.22.16** (2026-10-21)
   - Fix: **new DSH shell API compatibility** (`shell.run` removed upstream broke every request and blanked watchlists). New `runShell` shim: old `run`, new `execute`+`result()`.
   - Fix: **curl command-injection hardening** — URLs escape `'` to `%27`; kline symbols strip non-whitelisted chars and short-circuit to an empty result.

@@ -190,6 +190,11 @@ dsh-xueqiu/
 
 ## 📋 更新日志
 
+- **1.22.17**（2026-10-21）
+  - 加固：登录凭证文件写盘后自动 `chmod 600`（fs 无权限原语，借 shell 执行，失败不阻塞）；`actQuote` 超量截断显式返回 `truncated` 计数。
+  - 修复：`fmtTime` 兼容字符串时间戳、无效输入显示 `--:--:--`（此前 NaN:NaN:NaN）；稳定目录探测失败不再永久缓存回退路径（磁盘满恢复后自动回到稳定目录）；探针文件不再留时间戳数据。
+  - 性能：四张工具卡（Quote/Kline/Hot/News）`xqParseResult` 包 `useMemo`，流式更新重渲染时跳过重复 JSON.parse。
+  - 测试：CI 离线矩阵扩至全部 8 套件（此前 edge/fence/regress 等 346 断言仅本地跑）；新增 chmod/truncated 用例（unit 61）。
 - **1.22.16**（2026-10-21）
   - 修复：**适配新版 DSH shell API**（`shell.run` 移除导致所有请求报 `shell.run is not a function`、自选股不展示）。新增 `runShell` 兼容层：旧版走 `run`，新版走 `execute`+`result()`。
   - 修复：**curl 命令注入防御**——URL 单引号统一转义 `%27`（`encodeURIComponent` 不转义 `'`）；kline symbol 剥除非白名单字符，剥除后为空立即返回空结果。

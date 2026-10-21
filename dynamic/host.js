@@ -394,15 +394,17 @@ return {
     // ---- actions ----
     async function actQuote(args) {
       const symbols = Array.isArray(args.symbols) ? args.symbols : [String(args.symbols || '')]
-      const list = symbols.filter(function (s) { return /^[A-Za-z0-9_.]+$/.test(s) }).slice(0, 50)   // RPC 路径钳制（工具层另有 20 上限）
-      if (!list.length) return { list: [], status: null }
+      const all = symbols.filter(function (s) { return /^[A-Za-z0-9_.]+$/.test(s) })   // 工具层另有 20 上限
+      const list = all.slice(0, 50)   // RPC 路径第二道闸：超量部分显式告知调用方而非静默丢弃
+      if (!list.length) return { list: [], status: null, truncated: 0 }
       const data = await getJSON('/v5/stock/batch/quote.json', { symbol: list.join(',') }, { ttl: 10000 })
       const items = (data && data.data && data.data.items) || []
       const first = items[0]
       const status = first && first.market ? first.market.status_id : null
       return {
         status: nz(status),
-        list: items.map(function (it) { return pickQuote(it.quote) }).filter(Boolean)
+        list: items.map(function (it) { return pickQuote(it.quote) }).filter(Boolean),
+        truncated: all.length - list.length
       }
     }
 
@@ -545,9 +547,13 @@ return {
           if (!fs || !dir) return ''
           try {
             const probe = await fs.resolve(dir + '/.write-probe', { cwd: root })
-            await fs.writeText(probe, String(Date.now()))
+            await fs.writeText(probe, '')   // 探针不留数据（0 字节卫生）
             return dir
-          } catch (e) { return '' }
+          } catch (e) {
+            // 探测失败不永久缓存 ''：磁盘满等瞬时故障恢复后能自动回到稳定目录（读写均低频，重探代价可忽略）
+            stateBasePromise = null
+            return ''
+          }
         })()
       }
       return stateBasePromise
@@ -570,6 +576,14 @@ return {
       const target = await fs.resolve(base, { cwd: root })
       await fs.writeText(target, text)
       try { await fs.writeText(await fs.resolve(base + '.bak', { cwd: root }), text) } catch (e) { /* bak 尽力而为 */ }
+      // 登录凭证收紧权限（尽力而为）：fs 无 chmod 原语，借 shell 执行；失败不阻塞（默认 0644 的威胁模型见 README）
+      if (name === '.xueqiu-login.json') {
+        try {
+          const sh = getShell()
+          const pp = fs.processPath ? await fs.processPath(target) : target
+          if (sh && pp) await runShell(sh, sh.resolve({ command: "chmod 600 '" + String(pp).replace(/'/g, '') + "'", timeoutMs: 5000, stdoutMaxBytes: 1024 }))
+        } catch (e) { /* 权限收紧失败：文件仍受家目录 0755 约束 */ }
+      }
       return target
     }
     // 读 JSON：主文件 parse 失败（半截写损坏）时回退 .bak；两者皆败返回 null
