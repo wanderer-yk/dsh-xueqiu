@@ -190,6 +190,10 @@ dsh-xueqiu/
 
 ## 📋 更新日志
 
+- **1.24.0**（2026-10-22）
+  - 功能：**详情页盘中活性**——详情打开期间不再是一次性快照：标的所属市场开市时报价每 20s、分时每 60s 增量刷新（只合并 quote/minute，不动 K线/财务/KOL）。A股标的开市状态取共享指数层的真实 market status（节假日感知，法定假日不空转）；港美股退回本地时区推算。页面隐藏暂停、回前台立即补刷（5s 节流）；跨开/收市边界自愈；轮询失败静默（面板级轮询已在报错，双写只会刷屏）。
+  - 功能：**K线最后一根 bar 盘中滚动**——图表 loader 挂 `subscribeBar` 订阅（v10 原生流式通道：`_addData(t,'update')`，末根值演进 replace、新 bar 到点 push，不重置视图、保持拖拽/缩放位置，MA/VOL 自动重算）。20s 拉最新 5 根走 `begin=now` 零缓存路径（无 begin 的 kline 缓存 TTL 高达 5min，常规请求拿不到进行中的 bar）；以图表缓冲末根为准值有变化才触发；开市门/隐藏暂停同详情活性。图表容器留 `__xqLastBar`/`__xqTickInfo` 诊断钩子（e2e/排障用，画布内容无法从 DOM 断言）。
+  - 功能：分时图原地热更新——新数据经「改写 barsRef + `chart.resetData()`」走既有 loader 重新 init 加载（vendored v10 无 `applyNewData`/`updateData`，`resetData` 内部即 `_processDataLoad("init")`），不重建图表实例；涨跌色随最新价重算、笔数增长仍铺满宽度；签名守卫（笔数+末笔时间+昨收）防重复应用。
 - **1.23.1**（2026-10-22）
   - 重构：**XueqiuPanel 拆分**——680 行巨石组件收敛为 ~160 行组合层，状态与取数按领域拆为 4 个 hook（`useLogin` / `useWatchlistData` / `useHotNewsData` / `useDetailData`），六个内联渲染函数（登录框/行情/详情/热榜/搜索/快讯）提升为真正的组件（稳定组件身份，经 `el()` 渲染）；所有状态、竞态守卫与注释原样搬移，行为不变（8 套件 415 断言 + 浏览器 e2e 全绿）。
   - 修复：K线「加载更早」的 10 页配额此前不随换标/切周期重置——在一只标的上前插满 10 页后，切换其它标的/周期的前插会被永久卡死（配额计数现随 view/period effect 归零，与图表 remount 语义对齐）。

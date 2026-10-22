@@ -343,6 +343,23 @@ return {
       return [a && 'A股' + a, hk && '港股' + hk, us && '美股' + us].filter(Boolean).join(' · ')
     }
 
+    // A股开市 ref：接共享指数层的真实 market status（节假日感知——纯时区推算会在法定假日空转一整天）。
+    // 多处订阅（详情活性/K线滚动）零额外上游请求（共享层去重）。
+    function useAOpen() {
+      const ref = React.useRef(false)
+      React.useEffect(function () {
+        return subscribeIndices(function (list, status) { ref.current = status === 5 || status === 6 })
+      }, [])
+      return ref
+    }
+    // 按标的代码判所属市场是否开市：SH/SZ/BJ → A股真实 status；4-5 位纯数字 → 港股；其余 → 美股。
+    // 港美股无共享状态源退回时区推算（假日空转可接受：数据不变，仅多几个被 TTL 吞掉的请求）。
+    function sessionOpenFor(symbol, aOpenRef) {
+      if (/^(SH|SZ|BJ)/.test(symbol)) return !!(aOpenRef && aOpenRef.current)
+      if (/^[0-9]{4,5}$/.test(symbol)) return hkSession() === '盘中'
+      return usSession() === '盘中'
+    }
+
     // ---------- 共享 UI 状态：面板开合 / 当前标签 / 徽章位置 ----------
     const ui = {
       open: false, tab: 'market', badgePos: null, badgeW: null, dockH: null, hydrated: false,
@@ -554,8 +571,9 @@ return {
       const onNeedEarlier = props.onNeedEarlier || null
       const boxRef = React.useRef(null)
       const [noLib, setNoLib] = React.useState(false)
+      const aOpenRef = useAOpen()   // K线滚动活性的开市门（真实 status，节假日感知）
       const propsRef = React.useRef(null)
-      propsRef.current = { rows: rows, onNeedEarlier: onNeedEarlier }
+      propsRef.current = { rows: rows, onNeedEarlier: onNeedEarlier, symbol: props.symbol, period: props.period }
 
       // v1.22.10 起周期切换只清 kline 数据不重建详情骨架，图表可能先以空 rows 挂载、
       // 数据后到——与 MinuteChart 的 hasData 同款门控：空数据不建图，rows 到达时重建
@@ -568,6 +586,7 @@ return {
         if (!h) { setNoLib(true); return undefined }
         const chart = h.chart
         let busy = false
+        let barStop = null   // subscribeBar 轮询停止句柄（effect cleanup 直接停，不赖 chart destroy 退订链）
         // 顺序要求（实测 v10）：setPeriod → setSymbol → setDataLoader。若 setSymbol 在 setPeriod 之前，
         // 两者各触发一次 init 导致数据重复叠加；setPeriod 必须设置，否则 crosshair 不触发。
         const pm = { '5m': { type: 'minute', span: 5 }, '15m': { type: 'minute', span: 15 }, '30m': { type: 'minute', span: 30 }, '60m': { type: 'hour', span: 1 }, day: { type: 'day', span: 1 }, week: { type: 'week', span: 1 }, month: { type: 'month', span: 1 } }
@@ -591,7 +610,43 @@ return {
               const add = (fresh || []).filter(function (r) { return r.timestamp < params.timestamp })
               done(add, { forward: add.length > 0, backward: false })
             }, function () { busy = false; done([], { forward: false, backward: false }) })
-          }
+          },
+          // 盘中最后一根 bar 滚动：init 完成后 v10 自动调 subscribeBar，callback 喂单根 bar 走
+          // _addData(t,'update')——timestamp > 末根 push、=== 末根 replace。不重置视图（保持拖拽/
+          // 缩放位置），MA/VOL 指标随内部重算自动更新。20s 拉最新 2 根：begin=now 走零缓存路径
+          // （无 begin 的 kline 缓存 TTL 高达 5min(day)/30s(分钟)，常规请求长期命中旧缓存拿不到
+          // 进行中的 bar）。以图表缓冲末根（getDataList，含右拖前插的全部历史）为准，升序逐根
+          // 比对，值有变化才触发（防每 20s 无谓重绘）。开市门 + 页面隐藏暂停同详情活性。
+          subscribeBar: function (p) {
+            const cb = p.callback
+            const boxEl = boxRef.current   // 闭包捕获节点（卸载时 React 会置 null ref）
+            // 诊断钩子（浏览器 e2e/排障用）：画布内容无法从 DOM 断言，在图表容器上记录最近一次
+            // 应用到图表的滚动更新（push/replace 均记）
+            function noteApplied(b) { try { if (boxEl) boxEl.__xqLastBar = { ts: b.timestamp, close: b.close, volume: b.volume, at: Date.now() } } catch (e) { /* ignore */ } }
+            barStop = ctx.interval(function () {
+              const gate = (pageHidden() ? 'hidden' : (!sessionOpenFor(propsRef.current.symbol, aOpenRef) ? 'closed:' + propsRef.current.symbol : ''))
+              try { if (boxEl) boxEl.__xqTickInfo = { gate: gate, at: Date.now() } } catch (e) { /* ignore */ }
+              if (gate) return
+              call('kline', { symbol: propsRef.current.symbol, period: propsRef.current.period, count: 2, begin: Date.now() }).then(function (res) {
+                const fresh = klcNormRows((res && res.rows) || [])
+                try { if (boxEl) boxEl.__xqTickInfo = { gate: 'fetched:' + fresh.length, at: Date.now() } } catch (e) { /* ignore */ }
+                if (!fresh.length) return
+                let list
+                try { list = chart.getDataList() || [] } catch (e) { return }
+                let last = list.length ? list[list.length - 1] : null
+                fresh.forEach(function (b) {
+                  if (!last || b.timestamp > last.timestamp) {
+                    noteApplied(b); cb(b)   // 新 bar 到点：push（推进游标）
+                    last = b
+                  } else if (b.timestamp === last.timestamp &&
+                    (last.open !== b.open || last.high !== b.high || last.low !== b.low || last.close !== b.close || last.volume !== b.volume)) {
+                    noteApplied(b); cb(b)   // 同根 bar 值演进：replace
+                  }
+                })
+              }).catch(function () { /* 静默：下一轮 tick 重试 */ })
+            }, 20000)
+          },
+          unsubscribeBar: function () { if (barStop) { const s = barStop; barStop = null; try { s() } catch (e) { /* ignore */ } } }
         })
         // 均线叠加到主图蜡烛 pane（paneId 指定已有主图，不传则默认新开附图 pane）——与雪球一致
         chart.createIndicator({ name: 'MA', paneId: 'candle_pane' })
@@ -603,7 +658,9 @@ return {
         const onDbl = function () { try { chart.scrollToRealTime() } catch (e) { /* 忽略 */ } }
         box.addEventListener('dblclick', onDbl)
         return function () {
-          // 卸载清理时 boxRef.current 已被 React 置 null（切 tab 触发，曾致槽位整体崩溃），须闭包捕获节点
+          // 卸载清理时 boxRef.current 已被 React 置 null（切 tab 触发，曾致槽位整体崩溃），须闭包捕获节点；
+          // barStop 与 unsubscribeBar 双保险（不依赖 destroy 内部是否退订）
+          if (barStop) { const s = barStop; barStop = null; try { s() } catch (e) { /* ignore */ } }
           try { box.removeEventListener('dblclick', onDbl) } catch (e) { /* 忽略 */ }
           h.dispose()
         }
@@ -630,6 +687,11 @@ return {
       const [hi, setHi] = React.useState(null)
       const baseRef = React.useRef({ lastClose: lastClose })
       baseRef.current = { lastClose: lastClose }
+      // 盘中活性的命令式刷新通道：主 effect 依赖只有 [hasData, symbol]，items 引用变化不会触发
+      // 重建（重建=dispose+init，整图闪烁）。liveRef 持挂载实例句柄，供下方热更新 effect 改写
+      // barsRef 后调 resetData() 原地换数据；appliedSig 防重复应用（挂载时主 effect 已用同批数据建图）。
+      const liveRef = React.useRef(null)
+      const appliedSig = React.useRef('')
       // 分时数据是详情页渐进渲染晚到的一块（quote+kline 先上屏、minute 随后 merge）：
       // effect 依赖 [] 曾导致空 items 挂载后数据到达永不刷新（空白图）。改为「空数据不挂图表，
       // 数据到达（hasData 变 true）时重建」，彻底消除竞态窗口。
@@ -702,6 +764,9 @@ return {
         if (items.length > 1 && boxRef.current.clientWidth) {
           chart.setBarSpace(Math.max(boxRef.current.clientWidth / (items.length + 6), 0.1))
         }
+        // 挂载句柄就位 + 记录本批数据签名（热更新 effect 依此跳过挂载当次的重复应用）
+        liveRef.current = { chart: chart, barsRef: barsRef, toBars: toBars, box: boxRef.current }
+        appliedSig.current = items.length + ':' + (items.length ? items[items.length - 1].timestamp : 0) + ':' + lastClose
         // v10.0.2 的 onCrosshairChange 事件只带 {x,y,paneId}（文档声称的 kLineData 字段实际未填），
         // 用 convertFromPixel 反查 dataIndex，再从自有 bars 取明细
         chart.subscribeAction('onCrosshairChange', function (d) {
@@ -713,10 +778,33 @@ return {
           else setHi(null)
         })
         return function () {
+          liveRef.current = null
           try { chart.unsubscribeAction('onCrosshairChange') } catch (e) { /* 忽略 */ }
           h.dispose()
         }
       }, [hasData, props.symbol])
+
+      // 盘中热更新：新一批分时数据通过「改写 barsRef + resetData()」原地应用到已挂载图表。
+      // vendored v10 无 applyNewData/updateData（实测 UMD 无此符号），但 resetData 的内部实现
+      // 是 _processDataLoad("init")——用既有 loader 重新 init 加载，而 loader 闭包读的正是
+      // 可变 barsRef.v，所以换数据只需改引用再 resetData（涨跌色随最新价重算，笔数铺满重设宽度）。
+      // 签名（笔数+末笔时间+昨收）未变则跳过——merge 触发的重渲染不必然意味着数据前进。
+      React.useEffect(function () {
+        const h = liveRef.current
+        if (!h || !hasData) return
+        const sig = items.length + ':' + (items.length ? items[items.length - 1].timestamp : 0) + ':' + lastClose
+        if (sig === appliedSig.current) return
+        appliedSig.current = sig
+        if (typeof h.chart.resetData !== 'function') return   // 缺失环境保持旧图不崩（仅失去盘中活性）
+        h.barsRef.v = h.toBars(items, lastClose)
+        h.chart.resetData()
+        const last = items.length ? Number(items[items.length - 1].current) : 0
+        const up = lastClose ? last >= lastClose : true
+        try {
+          h.chart.setStyles({ candle: { type: 'area', area: { lineColor: up ? klcPalette().up : klcPalette().down, backgroundColor: up ? 'rgba(239,68,68,0.10)' : 'rgba(34,197,94,0.10)' } } })
+          if (items.length > 1 && h.box && h.box.clientWidth) h.chart.setBarSpace(Math.max(h.box.clientWidth / (items.length + 6), 0.1))
+        } catch (e) { /* 样式/宽度失败不影响数据已更新 */ }
+      }, [items, lastClose, hasData])
 
       if (noLib) return klcNoLib()
       if (!hasData) return el('div', { className: 'xq-chart-wrap', style: { display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--dsw-alias-label-secondary)', fontSize: 12 } }, '分时数据加载中…')
@@ -1018,9 +1106,54 @@ return {
           if (!alive || !res) return
           klineStash.current = res
           setDetail(function (d) { return d ? Object.assign({}, d, { kline: res }) : d })
-        }).catch(function () { /* 周期拉取失败：保持空图，不推翻已有详情 */ })
+        }).catch(function () { /* 周期拉取失败：保持空图，不推翻已有详情（无K线标的/瞬时失败均走此路径） */ })
         return function () { alive = false }
       }, [view, klinePeriod])
+
+      // A股开市状态（useAOpen/sessionOpenFor 见会话助手区）：
+      // tick 内自查开市状态，跨开/收市边界自愈（effect 无需依赖市场状态重启）
+      const aOpen = useAOpen()
+
+      // 盘中活性：详情打开期间，标的所属市场开市时增量刷新——报价每轮 20s、分时每 3 轮（60s）。
+      // 只 merge quote/minute（骨架其余部分不动；骨架未落地时跳过不强造）。tick 内自查开市状态，
+      // 跨开/收市边界自愈（effect 无需依赖市场状态重启）；页面隐藏暂停、回前台立即补刷（5s 节流）。
+      // 轮询失败静默：面板级轮询失败已会写 errBox，双路轮询同写只会重复刷屏。
+      React.useEffect(function () {
+        if (!view) return
+        let alive = true
+        let n = 0
+        let last = 0
+        function poll(minute) {
+          last = Date.now()
+          const p = minute
+            ? call('minute', { symbol: view })
+            : call('quoteDetail', { symbol: view })
+          p.then(function (res) {
+            if (!alive || !res) return
+            setDetail(function (d) {
+              if (!d) return d
+              return minute ? Object.assign({}, d, { minute: res }) : Object.assign({}, d, { quote: (res && res.quote) || d.quote })
+            })
+          }).catch(function () { /* 静默：保留上一次数据 */ })
+        }
+        function tick() {
+          if (!alive || pageHidden() || !sessionOpenFor(view, aOpen)) return
+          n++
+          poll(false)
+          if (n % 3 === 0) poll(true)
+        }
+        const stop = ctx.interval(tick, 20000)
+        function onVis() {
+          if (!pageHidden() && Date.now() - last > 5000) tick()
+        }
+        try { document.addEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
+        return function () {
+          alive = false
+          if (stop) stop()
+          try { document.removeEventListener('visibilitychange', onVis) } catch (e) { /* ignore */ }
+        }
+      }, [view])
+
       function openDetail(symbol) {
         setChartMode('kline')
         setKlinePeriod('day')
