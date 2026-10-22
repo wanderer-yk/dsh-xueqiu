@@ -12,13 +12,19 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 BASE_URL=${BASE_URL:-http://127.0.0.1:3080}
+# agent-browser 的 socket 目录默认在 ~/.agent-browser；沙箱/受限环境下可用 AGENT_BROWSER_SOCKET_DIR 改道
+[ -n "${AGENT_BROWSER_SOCKET_DIR:-}" ] && export AGENT_BROWSER_SOCKET_DIR
 PORT=$(echo "$BASE_URL" | grep -o '[0-9]*$')
 O="Origin: $BASE_URL"
+# 新版 dsh token 鉴权：E2E_TOKEN 存在时页面导航带 token（消费后种 auth cookie），rpc 直调带 query token
+PAGE_URL="$BASE_URL/"
+RPC_Q=""
+if [ -n "${E2E_TOKEN:-}" ]; then PAGE_URL="$BASE_URL/?token=$E2E_TOKEN"; RPC_Q="?token=$E2E_TOKEN"; fi
 
 FAIL=0
 pass() { printf '  ✅ %s\n' "$*"; }
 fail() { printf '  ❌ %s\n' "$*"; FAIL=1; }
-rpc() { curl -s -m 20 -X POST "$BASE_URL/xq-rpc" -H "$O" -H 'Content-Type: application/json' -d "$1"; }
+rpc() { curl -s -m 20 -X POST "$BASE_URL/xq-rpc$RPC_Q" -H "$O" -H 'Content-Type: application/json' -d "$1"; }
 ev() { agent-browser eval "$1" 2>/dev/null; }
 
 # ---- 状态保存/恢复 ----
@@ -43,7 +49,7 @@ trap 'agent-browser close >/dev/null 2>&1; restore >/dev/null 2>&1' EXIT
 echo "==> 浏览器交互回归  base=$BASE_URL"
 command -v agent-browser >/dev/null 2>&1 || { echo "❌ 需要 agent-browser"; exit 1; }
 
-agent-browser open "$BASE_URL/" >/dev/null 2>&1
+agent-browser open "$PAGE_URL" >/dev/null 2>&1
 sleep 8
 
 # ---- 1. 结构 ----
@@ -66,7 +72,7 @@ echo "-- 徽章拖拽"
 # 确定性起点：徽章遗留位置可能在视口边缘，让真实鼠标的拖拽/点击目标不可靠。
 # 先 rpc 固定到中部安全区再刷新页面，后续每步的目标坐标就不再依赖上一轮遗留状态。
 rpc '{"action":"ui.set","args":{"badgePos":{"x":420,"y":160},"badgeW":null}}' >/dev/null
-agent-browser open "$BASE_URL/" >/dev/null 2>&1; sleep 8
+agent-browser open "$PAGE_URL" >/dev/null 2>&1; sleep 8
 C=$(ev '(function(){var b=document.querySelector(".xq-badge").getBoundingClientRect();return Math.round(b.left+b.width/2)+","+Math.round(b.top+b.height/2)})()' | tr -d '"')
 X=${C%,*}; Y=${C#*,}
 agent-browser mouse move "$X" "$Y" >/dev/null && agent-browser mouse down >/dev/null \
@@ -129,7 +135,7 @@ R=$(ev 'document.querySelector(".xq-dock")?"OPEN":"CLOSED"')
 # ---- 5. 越屏恢复钳制 ----
 echo "-- 越屏恢复钳制"
 rpc '{"action":"ui.set","args":{"badgePos":{"x":99999,"y":99999}}}' >/dev/null
-agent-browser open "$BASE_URL/" >/dev/null 2>&1; sleep 8
+agent-browser open "$PAGE_URL" >/dev/null 2>&1; sleep 8
 R=$(ev '(function(){var b=document.querySelector(".xq-badge");if(!b)return "NO_BADGE";var r=b.getBoundingClientRect();return (r.left>=0&&r.top>=0&&r.right<=window.innerWidth+1&&r.bottom<=window.innerHeight+1)?"IN_VIEW":"OUT_"+Math.round(r.left)+","+Math.round(r.top)})()')
 [ "$R" = '"IN_VIEW"' ] && pass "越屏位置恢复时钳制回视口" || fail "徽章越屏 ($R)"
 

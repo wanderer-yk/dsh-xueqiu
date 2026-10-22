@@ -81,8 +81,21 @@ else
 fi
 echo $! > "$H/e2e.pid"
 
+# 新版 dsh web 默认 token 鉴权：裸 / 返回 401，token URL 见于 boot 日志。
+# 就绪判定：裸 200（旧版），或从日志抓 token 后 ?token= 返回 303/200（token 被消费即种 auth cookie）。
+TOKEN=""
 for i in $(seq 1 60); do
-  [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null || true)" = "200" ] && { echo "BASE_URL=http://127.0.0.1:$PORT"; exit 0; }
+  CODE="$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null || true)"
+  if [ "$CODE" = "200" ]; then echo "BASE_URL=http://127.0.0.1:$PORT"; exit 0; fi
+  if [ "$CODE" = "401" ] && [ -z "$TOKEN" ]; then
+    TOKEN=$(grep -o 'token=[A-Za-z0-9_-]*' "$H/e2e-boot.log" 2>/dev/null | head -1 | cut -d= -f2 || true)
+  fi
+  if [ -n "$TOKEN" ]; then
+    TCODE="$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/?token=$TOKEN" 2>/dev/null || true)"
+    if [ "$TCODE" = "303" ] || [ "$TCODE" = "200" ]; then
+      echo "BASE_URL=http://127.0.0.1:$PORT"; echo "E2E_TOKEN=$TOKEN"; exit 0
+    fi
+  fi
   sleep 1
 done
 echo "实例未启动；日志尾部:" >&2

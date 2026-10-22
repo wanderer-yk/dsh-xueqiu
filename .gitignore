@@ -5,3 +5,5 @@ dist/
 .xueqiu-ui-state.json
 .xueqiu-login.json
 .xueqiu-watchlist.json
+.xueqiu-*.json*
+.playwright-cli/
