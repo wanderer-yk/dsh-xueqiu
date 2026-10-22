@@ -1732,10 +1732,12 @@ exports.default = {
               ? Math.min(d.badgeW, 480) : 320
             const maxX = (vp ? vp.w : 1200) - effW - 4
             const maxY = (vp ? vp.h : 800) - 60
-            ui.set({ badgePos: {
-              x: Math.min(Math.max(4, Number(d.badgePos.x)), Math.max(4, maxX)),
-              y: Math.min(Math.max(4, Number(d.badgePos.y)), Math.max(4, maxY))
-            } })
+            const cx = Math.min(Math.max(4, Number(d.badgePos.x)), Math.max(4, maxX))
+            const cy = Math.min(Math.max(4, Number(d.badgePos.y)), Math.max(4, maxY))
+            ui.set({ badgePos: { x: cx, y: cy } })
+            // 钳制确有修正时立即落盘：否则 host 里残留越屏值，每次加载重钳一遍
+            // （面板关闭时无 DockPanel 订阅者代为落盘）
+            if (cx !== Number(d.badgePos.x) || cy !== Number(d.badgePos.y)) saveUi()
           }
           if (d && typeof d.dockH === 'number' && isFinite(d.dockH)) {
             ui.set({ dockH: d.dockH })
@@ -1931,7 +1933,10 @@ exports.default = {
         badgeMoved = false
         try { if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId) } catch (err) { /* ignore */ }
         if (!moved) { ui.set({ open: !ui.open }); return }
-        if (pos) ui.set({ badgePos: pos })   // 松手一次性提交
+        if (pos) {
+          ui.set({ badgePos: pos })   // 松手一次性提交
+          saveUi()   // 落盘（debounce）——徽章交互常态发生在面板关闭时，DockPanel 未挂载、无订阅者代为落盘
+        }
       }
 
       // ---- 宽度调节手柄：横向拖动改变徽章宽度（120–480px），松手持久化；双击复位为单行条 ----
