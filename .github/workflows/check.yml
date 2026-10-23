@@ -129,9 +129,12 @@ jobs:
           # boot 挂起时步骤零输出且永远等待（runs 6-9 结构性根因）。现：
           # bash -x 全程 trace（挂死时日志停在最后一条命令）+ timeout 300 硬保底
           # + 产物写 $DSH_HOME_DIR/e2e-env.sh 供 source。
-          timeout 300 bash -x scripts/e2e-ci-boot.sh 2>&1 | tee "${RUNNER_TEMP:-/tmp}/xq-boot-trace.log"
+          # 输出重定向到文件（管道 tee 会因后台 dsh 继承写端而让步骤卡在管道语义上——
+          # runs 8-11 零输出 24 分钟的最终根因链）；文件不等任何写端，boot 挂起时
+          # timeout 300 硬杀、|| true 防 -e 提前退出，env 文件缺失时打 trace 尾部定界
+          timeout 300 bash -x scripts/e2e-ci-boot.sh > "${RUNNER_TEMP:-/tmp}/xq-boot-trace.log" 2>&1 || true
           ENV_FILE="${DSH_HOME_DIR:-/tmp/xq-e2e-home}/e2e-env.sh"
-          [ -f "$ENV_FILE" ] || { echo "❌ boot 未产出 env 文件（trace 见上）"; exit 1; }
+          [ -f "$ENV_FILE" ] || { echo "❌ boot 失败/超时，trace 尾部:"; tail -30 "${RUNNER_TEMP:-/tmp}/xq-boot-trace.log"; exit 1; }
           source "$ENV_FILE"
           BASE_URL="${BASE_URL:-http://127.0.0.1:3210}" E2E_TOKEN="${E2E_TOKEN:-}" bash scripts/browser-interact.sh
         env:
