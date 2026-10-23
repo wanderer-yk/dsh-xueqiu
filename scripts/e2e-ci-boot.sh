@@ -75,12 +75,14 @@ if ! (cd "$H" && DSH_HOME="$H" "$DSH_BIN" plugin --profile web add "$E2E_PLUGIN_
   fi
 fi
 if command -v setsid >/dev/null 2>&1; then
-  setsid sh -c "cd '$WS_ABS' && DSH_HOME='$H' E2E_UNUSED_API_KEY='e2e-dummy-key' '$DSH_BIN' --profile web --port '$PORT' >'$H/e2e-boot.log' 2>&1" &
+  nohup sh -c "cd '$WS_ABS' && DSH_HOME='$H' E2E_UNUSED_API_KEY='e2e-dummy-key' '$DSH_BIN' --profile web --port '$PORT' >'$H/e2e-boot.log' 2>&1" &
 else
-  sh -c "cd '$WS_ABS' && DSH_HOME='$H' E2E_UNUSED_API_KEY='e2e-dummy-key' '$DSH_BIN' --profile web --port '$PORT' >'$H/e2e-boot.log' 2>&1" &
+  nohup sh -c "cd '$WS_ABS' && DSH_HOME='$H' E2E_UNUSED_API_KEY='e2e-dummy-key' '$DSH_BIN' --profile web --port '$PORT' >'$H/e2e-boot.log' 2>&1" &
 fi
+disown 2>/dev/null || true
 echo $! > "$H/e2e.pid"
 
+echo "-- dsh web 已后台启动（pid $(cat "$H/e2e.pid" 2>/dev/null || echo ?)），就绪探测中..."
 # 新版 dsh web 默认 token 鉴权：裸 / 返回 401，token URL 见于 boot 日志。
 # 就绪判定：裸 200（旧版），或从日志抓 token 后 ?token= 返回 303/200（token 被消费即种 auth cookie）。
 TOKEN=""
