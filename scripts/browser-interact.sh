@@ -73,7 +73,21 @@ sleep 3
 
 # ---- 1. 结构 ----
 echo "-- 徽章结构与挂载"
-R=$(ev 'document.querySelector(".xq-badge") ? "OK" : "NO"')
+# SPA 冷启动 + token 消费 + 插件挂载在慢 runner 上可超 8s（2026-10-23 CI tag run 实证：
+# 单次 sleep 8 一锤定音误报"未挂载"）——改轮询 6×5s；最终失败输出分层诊断，
+# 区分"插件没被加载"（boot 清单/加载器缺失 → dsh 侧问题）与"加载了没挂上"（→插件代码问题）。
+R="NO"
+for i in 1 2 3 4 5 6; do
+  R=$(ev 'document.querySelector(".xq-badge") ? "OK" : "NO"')
+  [ "$R" = '"OK"' ] && break
+  sleep 5
+done
+if [ "$R" != '"OK"' ]; then
+  echo "     诊断: url=$(ev 'location.href' 2>/dev/null | head -c 80)"
+  echo "     诊断: boot清单含插件=$(ev 'typeof window.__DSH_BOOT__==="object" ? String(JSON.stringify(window.__DSH_BOOT__)).includes("dsh-xueqiu") : "no-boot"' 2>/dev/null)"
+  echo "     诊断: 插件样式标签=$(ev '!!document.querySelector("style[data-plugin=dsh-xueqiu]")' 2>/dev/null)"
+  echo "     诊断: 模块加载器=$(ev 'typeof window.__ModuleLoader__ !== "undefined" ? "yes" : "no"' 2>/dev/null)"
+fi
 [ "$R" = '"OK"' ] && pass "徽章挂载" || { fail "徽章未挂载 ($R)"; exit 1; }
 R=$(ev '(function(){var h=document.querySelector(".xq-badge-hd");return h?getComputedStyle(h).flexDirection:"NO_HD"})()')
 [ "$R" = '"row"' ] && pass "头部行水平排列" || fail "头部行排列异常 ($R)"

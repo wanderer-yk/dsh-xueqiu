@@ -91,18 +91,36 @@ else
   SERVER_PID=$!
 fi
 up=0
+TOKEN=""
 for i in $(seq 1 60); do
+  # 新版 dsh web 默认 token 鉴权：裸 / 返回 401（曾致 60s 探测全空转、误报"实例未启动"，
+  # 且 boot 日志里明明打印了 token URL——2026-10-23 CI v1.25.0 tag run 实证）。
+  # 就绪判定对齐 e2e-ci-boot.sh：裸 200（旧版）或 ?token= 得 200/303（新版）。
   code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null)
   [ "$code" = "200" ] && { up=1; break; }
+  if [ -z "$TOKEN" ]; then
+    TOKEN=$(grep -o 'token=[A-Za-z0-9_-]*' "$BOOT_LOG" 2>/dev/null | head -1 | cut -d= -f2 || true)
+  fi
+  if [ -n "$TOKEN" ]; then
+    tcode=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/?token=$TOKEN" 2>/dev/null)
+    if [ "$tcode" = "200" ] || [ "$tcode" = "303" ]; then up=1; break; fi
+  fi
   sleep 1
 done
 if [ "$up" = 1 ]; then
-  pass "实例启动且首页 200"
+  if [ -n "$TOKEN" ]; then
+    pass "实例启动且首页可达（token 鉴权）"
+  else
+    pass "实例启动且首页 200"
+  fi
 else
   fail "实例未启动（v1.7.0 同款崩溃？）— 启动日志尾部:"
   tail -5 "$BOOT_LOG" | sed 's/^/     /'
   exit 1
 fi
+# 后续关卡的鉴权后缀：新版 dsh 带 ?token=，旧版为空串（URL 不变）
+AUTH=""
+[ -n "$TOKEN" ] && AUTH="?token=$TOKEN"
 if grep -qi 'error' "$BOOT_LOG"; then
   fail "启动日志含 error:"
   grep -i error "$BOOT_LOG" | head -3 | sed 's/^/     /'
@@ -112,7 +130,7 @@ fi
 
 # ---- 4. boot 清单 ----
 say "-- 4/7 __DSH_BOOT__ 清单"
-BOOT=$(curl -s "http://127.0.0.1:$PORT/")
+BOOT=$(curl -s "http://127.0.0.1:$PORT/$AUTH")
 if echo "$BOOT" | grep -q '"id":"dsh-xueqiu"'; then
   pass "boot 清单含 dsh-xueqiu client 行"
 else
@@ -121,7 +139,7 @@ fi
 
 # ---- 5. client bundle ----
 say "-- 5/7 client bundle 格式"
-BUNDLE=$(curl -s "http://127.0.0.1:$PORT/plugins/dsh-xueqiu/client.js")
+BUNDLE=$(curl -s "http://127.0.0.1:$PORT/plugins/dsh-xueqiu/client.js$AUTH")
 # 注意：不要用 echo|head|grep（pipefail 下 SIGPIPE 会误报），用 bash 字符串匹配
 if [[ "$BUNDLE" == *__ModuleLoader__* ]]; then
   pass "bundle 是 __ModuleLoader__ 工厂格式"
@@ -139,7 +157,7 @@ fi
 # ---- 6. RPC 真实数据 ----
 say "-- 6/7 /xq-rpc 行情"
 # v1.22.8 起 Origin 必须存在且同源（浏览器对同源 POST 必带 Origin）——模拟真实浏览器调用
-QUOTE=$(curl -s -m 30 -X POST "http://127.0.0.1:$PORT/xq-rpc" -H 'Content-Type: application/json' -H "Origin: http://127.0.0.1:$PORT" -d '{"action":"quote","args":{"symbols":"SH600519"}}')
+QUOTE=$(curl -s -m 30 -X POST "http://127.0.0.1:$PORT/xq-rpc$AUTH" -H 'Content-Type: application/json' -H "Origin: http://127.0.0.1:$PORT" -d '{"action":"quote","args":{"symbols":"SH600519"}}')
 if [[ "$QUOTE" == *'"ok":true'* ]]; then
   pass "RPC 返回真实行情"
 elif [ "$SMOKE_LIVE" = "warn" ] && [[ "$QUOTE" == *'[seed_blocked]'* || "$QUOTE" == *'[cookie_expired]'* || "$QUOTE" == *'[waf]'* || "$QUOTE" == *'[empty'* || "$QUOTE" == *'[rate_limited]'* || "$QUOTE" == *'[network]'* ]]; then
@@ -151,12 +169,12 @@ fi
 
 # ---- 7. 栅栏 ----
 say "-- 7/7 同源栅栏"
-if [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/xq-rpc" -H 'Origin: http://evil.example' -d '{}')" = "403" ]; then
+if [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/xq-rpc$AUTH" -H 'Origin: http://evil.example' -d '{}')" = "403" ]; then
   pass "恶意 Origin 被 403"
 else
   fail "栅栏未拦截跨源请求"
 fi
-if [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/xq-rpc" -H 'Content-Type: application/json' -d '{}')" = "403" ]; then
+if [ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/xq-rpc$AUTH" -H 'Content-Type: application/json' -d '{}')" = "403" ]; then
   pass "无 Origin 直调被 403（v1.22.8 起要求 Origin 必须存在）"
 else
   fail "无 Origin 直调未被拦截"
