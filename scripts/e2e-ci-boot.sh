@@ -91,10 +91,11 @@ for i in $(seq 1 60); do
     TOKEN=$(grep -o 'token=[A-Za-z0-9_-]*' "$H/e2e-boot.log" 2>/dev/null | head -1 | cut -d= -f2 || true)
   fi
   if [ -n "$TOKEN" ]; then
-    TCODE="$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/?token=$TOKEN" 2>/dev/null || true)"
-    if [ "$TCODE" = "303" ] || [ "$TCODE" = "200" ]; then
-      echo "BASE_URL=http://127.0.0.1:$PORT"; echo "E2E_TOKEN=$TOKEN"; exit 0
-    fi
+    # 注意：不要在这里 curl token URL 验证！新版 dsh 的 token 是单次消费语义
+    # （消费即作废，2026-10-23 CI 实证：boot 探针 curl 消费后，浏览器再开同
+    # token 落在 "dsh web authentication required" 页）。服务打印带 token 的
+    # URL 即代表已监听就绪——把唯一一次消费留给浏览器。
+    echo "BASE_URL=http://127.0.0.1:$PORT"; echo "E2E_TOKEN=$TOKEN"; exit 0
   fi
   sleep 1
 done
