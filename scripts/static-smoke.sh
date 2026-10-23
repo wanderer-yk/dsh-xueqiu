@@ -151,12 +151,17 @@ say "-- 5/7 client bundle 格式"
 BUNDLE=""
 HIT_URL=""
 TRIED=""
+# 候选 0（0.2.x 权威路径）：boot 清单 manifest 自带 url 字段——
+# {"id":"dsh-xueqiu","url":"plugins/??dsh-xueqiu/client.js&rev=..."}（组合语法+相对路径，
+# &amp; 需还原；本地 0.1.1 无此字段自动跳过）
+CAND0=$(printf '%s' "$BOOT" | grep -oE '"id":"dsh-xueqiu","url":"[^"]*"' | head -1 | sed 's/.*"url":"//; s/"$//; s/&amp;/\&/g')
+case "$CAND0" in /*) ;; "") ;; *) CAND0="/$CAND0" ;; esac
 CAND1=$(printf '%s' "$BOOT" | grep -oE '/plugins/dsh-xueqiu/client\.js[^"'\'' ]*' | head -1)
 [ -n "$CAND1" ] && TRIED="$TRIED 1:$CAND1"
 REV=$(printf '%s' "$BOOT" | grep -oE 'client\.js\?rev=[0-9a-f]+' | head -1 | sed 's/.*rev=//')
 CAND2="/plugins/dsh-xueqiu/client.js"
 [ -n "$REV" ] && CAND2="/plugins/dsh-xueqiu/client.js?rev=$REV"
-for u in "$CAND1" "$CAND2" "/plugins/dsh-xueqiu/client.js$AUTH"; do
+for u in "$CAND0" "$CAND1" "$CAND2" "/plugins/dsh-xueqiu/client.js$AUTH"; do
   [ -z "$u" ] && continue
   B=$(curl -s -b "$JAR" "http://127.0.0.1:$PORT$u")
   if [[ "$B" == *__ModuleLoader__* ]]; then BUNDLE="$B"; HIT_URL="$u"; break; fi
