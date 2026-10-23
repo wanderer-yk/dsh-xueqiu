@@ -119,8 +119,11 @@ jobs:
         run: npx playwright install chromium --with-deps
       - name: Boot synthetic DSH instance + run browser E2E
         run: |
-          bash scripts/e2e-ci-boot.sh
-          BASE_URL=http://127.0.0.1:3210 bash scripts/browser-interact.sh
+          # boot 脚本输出 "BASE_URL=..." / "E2E_TOKEN=..."（新版 dsh 的 token 单次消费：
+          # 浏览器是唯一消费点，必须把 token 传给 browser-interact——此前没接，
+          # e2e 一直开裸 / 落在鉴权页，CI 上从未真正跑过插件）
+          eval "$(bash scripts/e2e-ci-boot.sh)"
+          BASE_URL="${BASE_URL:-http://127.0.0.1:3210}" E2E_TOKEN="${E2E_TOKEN:-}" bash scripts/browser-interact.sh
         env:
           DSH_HOME_DIR: /tmp/xq-e2e-home
           WORKSPACE_DIR: /tmp/xq-e2e-home/ws

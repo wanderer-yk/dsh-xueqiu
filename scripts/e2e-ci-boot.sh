@@ -88,7 +88,8 @@ for i in $(seq 1 60); do
   CODE="$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null || true)"
   if [ "$CODE" = "200" ]; then echo "BASE_URL=http://127.0.0.1:$PORT"; exit 0; fi
   if [ "$CODE" = "401" ] && [ -z "$TOKEN" ]; then
-    TOKEN=$(grep -o 'token=[A-Za-z0-9_-]*' "$H/e2e-boot.log" 2>/dev/null | head -1 | cut -d= -f2 || true)
+    # tail -1：服务可能多次打印 token URL（轮换），旧的已作废——最后一次才是活的
+    TOKEN=$(grep -o 'token=[A-Za-z0-9_-]*' "$H/e2e-boot.log" 2>/dev/null | tail -1 | cut -d= -f2 || true)
   fi
   if [ -n "$TOKEN" ]; then
     # 注意：不要在这里 curl token URL 验证！新版 dsh 的 token 是单次消费语义

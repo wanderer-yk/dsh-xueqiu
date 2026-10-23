@@ -162,6 +162,21 @@ for u in "$CAND1" "$CAND2" "/plugins/dsh-xueqiu/client.js$AUTH"; do
   if [[ "$B" == *__ModuleLoader__* ]]; then BUNDLE="$B"; HIT_URL="$u"; break; fi
   TRIED="$TRIED | $u→$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "http://127.0.0.1:$PORT$u")"
 done
+# 合并式兜底（2026-10-23 CI 实证：新 dsh 把 bundle 层合并进宿主主 bundle，独立插件
+# 资源路径 404 且页面无插件 script src）——扫页面全部 script src，逐个取回找插件标记。
+# 命中即证明"插件 client 确实被浏览器加载"，与独立文件形态等价。
+if [[ "$BUNDLE" != *__ModuleLoader__* ]]; then
+  while read -r src; do
+    [ -z "$src" ] && continue
+    case "$src" in /*) ;; *) continue ;; esac
+    B=$(curl -s -b "$JAR" "http://127.0.0.1:$PORT$src")
+    if [[ "$B" == *__ModuleLoader__* && "$B" == *dsh-xueqiu* ]]; then
+      BUNDLE="$B"; HIT_URL="$src（合并式）"; break
+    fi
+  done <<EOF
+$(printf '%s' "$BOOT" | grep -oE 'src="[^"]*"' | sed 's/src="//; s/"$//' | head -8)
+EOF
+fi
 if [[ "$BUNDLE" == *__ModuleLoader__* ]]; then
   pass "bundle 是 __ModuleLoader__ 工厂格式 (src=$HIT_URL)"
 else
