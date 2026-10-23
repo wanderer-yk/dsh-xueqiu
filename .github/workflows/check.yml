@@ -125,10 +125,14 @@ jobs:
         run: npx playwright install chromium --with-deps
       - name: Boot synthetic DSH instance + run browser E2E
         run: |
-          # boot 脚本输出 "BASE_URL=..." / "E2E_TOKEN=..."（新版 dsh 的 token 单次消费：
-          # 浏览器是唯一消费点，必须把 token 传给 browser-interact——此前没接，
-          # e2e 一直开裸 / 落在鉴权页，CI 上从未真正跑过插件）
-          eval "$(bash scripts/e2e-ci-boot.sh)"
+          # boot 产物走 env 文件而非 stdout 捕获：eval/$() 会吞掉 boot 全部输出，
+          # boot 挂起时步骤零输出且永远等待（runs 6-9 结构性根因）。现：
+          # bash -x 全程 trace（挂死时日志停在最后一条命令）+ timeout 300 硬保底
+          # + 产物写 $DSH_HOME_DIR/e2e-env.sh 供 source。
+          timeout 300 bash -x scripts/e2e-ci-boot.sh 2>&1 | tee "${RUNNER_TEMP:-/tmp}/xq-boot-trace.log"
+          ENV_FILE="${DSH_HOME_DIR:-/tmp/xq-e2e-home}/e2e-env.sh"
+          [ -f "$ENV_FILE" ] || { echo "❌ boot 未产出 env 文件（trace 见上）"; exit 1; }
+          source "$ENV_FILE"
           BASE_URL="${BASE_URL:-http://127.0.0.1:3210}" E2E_TOKEN="${E2E_TOKEN:-}" bash scripts/browser-interact.sh
         env:
           DSH_HOME_DIR: /tmp/xq-e2e-home

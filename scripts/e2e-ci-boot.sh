@@ -86,7 +86,11 @@ echo $! > "$H/e2e.pid"
 TOKEN=""
 for i in $(seq 1 60); do
   CODE="$(curl -s -m 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/" 2>/dev/null || true)"
-  if [ "$CODE" = "200" ]; then echo "BASE_URL=http://127.0.0.1:$PORT"; exit 0; fi
+  if [ "$CODE" = "200" ]; then
+    echo "BASE_URL=http://127.0.0.1:$PORT"
+    printf 'BASE_URL=%q\nE2E_TOKEN=%q\n' "http://127.0.0.1:$PORT" "" > "$H/e2e-env.sh"
+    exit 0
+  fi
   if [ "$CODE" = "401" ] && [ -z "$TOKEN" ]; then
     # tail -1：服务可能多次打印 token URL（轮换），旧的已作废——最后一次才是活的
     TOKEN=$(grep -o 'token=[A-Za-z0-9_-]*' "$H/e2e-boot.log" 2>/dev/null | tail -1 | cut -d= -f2 || true)
@@ -96,7 +100,9 @@ for i in $(seq 1 60); do
     # （消费即作废，2026-10-23 CI 实证：boot 探针 curl 消费后，浏览器再开同
     # token 落在 "dsh web authentication required" 页）。服务打印带 token 的
     # URL 即代表已监听就绪——把唯一一次消费留给浏览器。
-    echo "BASE_URL=http://127.0.0.1:$PORT"; echo "E2E_TOKEN=$TOKEN"; exit 0
+    echo "BASE_URL=http://127.0.0.1:$PORT"; echo "E2E_TOKEN=$TOKEN"
+    printf 'BASE_URL=%q\nE2E_TOKEN=%q\n' "http://127.0.0.1:$PORT" "$TOKEN" > "$H/e2e-env.sh"
+    exit 0
   fi
   sleep 1
 done
