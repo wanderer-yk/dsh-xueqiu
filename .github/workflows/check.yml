@@ -117,7 +117,10 @@ jobs:
         with:
           node-version: 22
       - name: Install dsh CLI + pnpm + agent-browser
-        run: npm i -g @deepseek-ai/dsh pnpm agent-browser
+        # agent-browser 锁定 0.27.0（本地验证可用的版本）：新版可能改变 open 的默认
+        # 等待策略（如 network-idle——dsh web 有常驻连接永不 idle，会精确复现
+        # "本地过、CI 挂"），升版本需先在本地对 0.2.x dsh 全流程彩排
+        run: npm i -g @deepseek-ai/dsh pnpm agent-browser@0.27.0
       - name: Install Chromium for agent-browser
         run: npx playwright install chromium --with-deps
       - name: Boot synthetic DSH instance + run browser E2E

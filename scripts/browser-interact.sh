@@ -26,7 +26,15 @@ SKIP=0
 pass() { printf '  ✅ %s\n' "$*"; }
 fail() { printf '  ❌ %s\n' "$*"; FAIL=1; }
 skip() { printf '  ⏭️  %s（环境豁免，不计失败）\n' "$*"; SKIP=1; }
-ev() { agent-browser eval "$1" 2>/dev/null; }
+# ab(): agent-browser 全调用统一 60s 超时——CI 慢环境单命令挂死时快速失败并让
+# 日志停在卡点（2026-10-23 第 6/7 轮 tag CI 实证 17+ 分钟无输出挂起，远程无法内省）。
+# macOS 本地无 timeout 命令时直通（本地全流程 3 分钟，不需要）。
+if command -v timeout >/dev/null 2>&1; then
+  ab() { timeout 60 agent-browser "$@"; }
+else
+  ab() { agent-browser "$@"; }
+fi
+ev() { ab eval "$1" 2>/dev/null; }
 # token 鉴权模式（新版 dsh，单次消费语义——2026-10-23 CI 实证）：
 # 浏览器 open PAGE_URL 是唯一一次 token 消费（种 auth cookie），此后 curl 已无凭据可用，
 # rpc() 全部改走页面同源 fetch（借浏览器 cookie 鉴权）。无 token 模式（旧版 dsh/本地）维持 curl。
@@ -36,7 +44,7 @@ rpc() {
   if [ -n "${E2E_TOKEN:-}" ]; then
     # body 必须 JSON.stringify（fetch 只收字符串，直接传对象会变 "[object Object]"，
     # 服务端解析出 action:undefined——CI 实测）；输出经 jq -c 压平成与 curl 一致的
-    # 紧凑单行 JSON（agent-browser 对返回对象是 2 空格缩进 pretty 打印，会打断
+    # 紧凑单行 JSON（ab 对返回对象是 2 空格缩进 pretty 打印，会打断
     # 脚本里所有 "badgePos":{...} 形状的行内 grep 断言）。jq 缺失时原样透传（弱化但不崩）。
     local out
     out=$(ev "(async function(){try{const r=await fetch('/xq-rpc',{method:'POST',headers:{'Content-Type':'application/json','Origin':location.origin},body:JSON.stringify($1)});return await r.json()}catch(e){return {ok:false,error:'E2E_PAGE_FETCH:'+String(e&&e.message||e)}}})()")
@@ -47,7 +55,7 @@ rpc() {
 }
 
 # 浏览器必须最先消费 token（在第一次 rpc 之前！）——先开页面种 cookie，再备份状态
-agent-browser open "$PAGE_URL" >/dev/null 2>&1
+ab open "$PAGE_URL" >/dev/null 2>&1
 sleep 8
 
 # ---- 状态保存/恢复 ----
@@ -68,7 +76,7 @@ restore() {
   rpc "{\"action\":\"ui.set\",\"args\":{$(IFS=,; echo "${args[*]}")}}" >/dev/null
   return 0
 }
-trap 'restore >/dev/null 2>&1; agent-browser close >/dev/null 2>&1' EXIT
+trap 'restore >/dev/null 2>&1; ab close >/dev/null 2>&1' EXIT
 
 echo "==> 浏览器交互回归  base=$BASE_URL"
 command -v agent-browser >/dev/null 2>&1 || { echo "❌ 需要 agent-browser"; exit 1; }
@@ -103,7 +111,7 @@ for i in 1 2 3 4 5 6; do
   # 浏览器再开同 token 落在无应用内容的页面），第 3 轮起用同 token 重开一次
   if [ "$i" = 3 ]; then
     HASLOADER=$(ev 'typeof window.__ModuleLoader__ !== "undefined" ? "yes" : "no"' 2>/dev/null)
-    [ "$HASLOADER" != '"yes"' ] && { agent-browser open "$PAGE_URL" >/dev/null 2>&1; sleep 6; }
+    [ "$HASLOADER" != '"yes"' ] && { ab open "$PAGE_URL" >/dev/null 2>&1; sleep 6; }
   fi
   sleep 5
 done
@@ -143,12 +151,12 @@ echo "-- 徽章拖拽"
 # 确定性起点：徽章遗留位置可能在视口边缘，让真实鼠标的拖拽/点击目标不可靠。
 # 先 rpc 固定到中部安全区再刷新页面，后续每步的目标坐标就不再依赖上一轮遗留状态。
 rpc '{"action":"ui.set","args":{"badgePos":{"x":420,"y":160},"badgeW":null}}' >/dev/null
-agent-browser open "$PAGE_URL" >/dev/null 2>&1; sleep 8
+ab open "$PAGE_URL" >/dev/null 2>&1; sleep 8
 C=$(ev '(function(){var b=document.querySelector(".xq-badge").getBoundingClientRect();return Math.round(b.left+b.width/2)+","+Math.round(b.top+b.height/2)})()' | tr -d '"')
 X=${C%,*}; Y=${C#*,}
-agent-browser mouse move "$X" "$Y" >/dev/null && agent-browser mouse down >/dev/null \
-  && agent-browser mouse move $((X-100)) $((Y+80)) >/dev/null && agent-browser mouse move $((X-105)) $((Y+85)) >/dev/null \
-  && agent-browser mouse up >/dev/null
+ab mouse move "$X" "$Y" >/dev/null && ab mouse down >/dev/null \
+  && ab mouse move $((X-100)) $((Y+80)) >/dev/null && ab mouse move $((X-105)) $((Y+85)) >/dev/null \
+  && ab mouse up >/dev/null
 sleep 3   # saveUi 800ms debounce + ui.set 往返
 R=$(ev '(function(){var b=document.querySelector(".xq-badge");return b.style.left&&b.style.left!==""?"MOVED":"NOT"})()')
 [ "$R" = '"MOVED"' ] && pass "拖拽位置样式生效" || fail "拖拽未生效 ($R)"
@@ -166,9 +174,9 @@ echo "-- 手柄调宽/复位"
 BASE_W=$(ev 'Math.round(document.querySelector(".xq-badge").getBoundingClientRect().width)' | tr -d '"')
 C=$(ev '(function(){var g=document.querySelector(".xq-badge-grip").getBoundingClientRect();return Math.round(g.left+g.width/2)+","+Math.round(g.top+g.height/2)})()' | tr -d '"')
 X=${C%,*}; Y=${C#*,}
-agent-browser mouse move "$X" "$Y" >/dev/null && agent-browser mouse down >/dev/null \
-  && agent-browser mouse move $((X+100)) "$Y" >/dev/null && agent-browser mouse move $((X+101)) "$Y" >/dev/null \
-  && agent-browser mouse up >/dev/null
+ab mouse move "$X" "$Y" >/dev/null && ab mouse down >/dev/null \
+  && ab mouse move $((X+100)) "$Y" >/dev/null && ab mouse move $((X+101)) "$Y" >/dev/null \
+  && ab mouse up >/dev/null
 sleep 3
 W=$(ev 'Math.round(document.querySelector(".xq-badge").getBoundingClientRect().width)' | tr -d '"')
 BW=$(rpc '{"action":"ui.get","args":{}}' | grep -o '"badgeW":[0-9]*' | grep -o '[0-9]*$' || true)
@@ -183,16 +191,16 @@ BW=$(rpc '{"action":"ui.get","args":{}}' | grep -o '"badgeW":[0-9]*' | grep -o '
 
 # ---- 4. 面板开关 + 四 tab ----
 echo "-- 面板与 tab"
-agent-browser click ".xq-badge" >/dev/null 2>&1; sleep 3
+ab click ".xq-badge" >/dev/null 2>&1; sleep 3
 # 首击可能早于徽章 hydrate（点击被吞）——面板没出现就再点一次
 if ! ev '(document.querySelector(".xq-dock")?"1":"0")' | grep -q '"1"'; then
-  agent-browser click ".xq-badge" >/dev/null 2>&1; sleep 4
+  ab click ".xq-badge" >/dev/null 2>&1; sleep 4
 fi
 R=$(ev '(function(){var d=document.querySelector(".xq-dock");if(!d)return "NO_DOCK";return Array.prototype.map.call(document.querySelectorAll(".xq-tab"),function(x){return x.textContent}).join(",")})()')
 [ "$R" = '"行情,热榜,搜索,快讯"' ] && pass "面板打开 + 四 tab 齐全" || fail "面板/tab 异常 ($R)"
 # 热榜：切 tab 后数据来自最长 60s 的内容轮询，轮询等待而非 5s 定时断言；
 # 上游拦截（WAF/凭据过期）直接探 RPC 错误码 —— 宿主侧正确分类，环境豁免
-agent-browser eval '(function(){var t=document.querySelectorAll(".xq-tab");for(var i=0;i<t.length;i++)if(t[i].textContent==="热榜")t[i].click()})()' >/dev/null
+ab eval '(function(){var t=document.querySelectorAll(".xq-tab");for(var i=0;i<t.length;i++)if(t[i].textContent==="热榜")t[i].click()})()' >/dev/null
 if [ "$DATA_OK" = 1 ]; then
 HOT_N=0
 for i in $(seq 1 14); do
@@ -209,7 +217,7 @@ else
   [ -n "$HERR" ] && skip "热榜上游不可用（$HERR）" || fail "热榜无数据 ($HOT_N)"
 fi
 fi
-agent-browser eval '(function(){var t=document.querySelectorAll(".xq-tab");for(var i=0;i<t.length;i++)if(t[i].textContent==="快讯")t[i].click()})()' >/dev/null
+ab eval '(function(){var t=document.querySelectorAll(".xq-tab");for(var i=0;i<t.length;i++)if(t[i].textContent==="快讯")t[i].click()})()' >/dev/null
 if [ "$DATA_OK" = 1 ]; then
 NEWS_N=0
 for i in $(seq 1 8); do
@@ -226,17 +234,17 @@ else
   [ -n "$NERR" ] && skip "快讯上游不可用（$NERR）" || fail "快讯无内容 ($NEWS_N)"
 fi
 fi
-agent-browser eval '(function(){var t=document.querySelectorAll(".xq-tab");for(var i=0;i<t.length;i++)if(t[i].textContent==="搜索")t[i].click()})()' >/dev/null; sleep 3
+ab eval '(function(){var t=document.querySelectorAll(".xq-tab");for(var i=0;i<t.length;i++)if(t[i].textContent==="搜索")t[i].click()})()' >/dev/null; sleep 3
 R=$(ev '(function(){var d=document.querySelector(".xq-dock");return d&&d.querySelector("input")?"OK":"NO"})()')
 [ "$R" = '"OK"' ] && pass "搜索 tab 有输入框" || fail "搜索输入框缺失 ($R)"
-agent-browser click ".xq-badge" >/dev/null 2>&1; sleep 2
+ab click ".xq-badge" >/dev/null 2>&1; sleep 2
 R=$(ev 'document.querySelector(".xq-dock")?"OPEN":"CLOSED"')
 [ "$R" = '"CLOSED"' ] && pass "再点徽章关闭面板" || fail "面板未关闭 ($R)"
 
 # ---- 5. 越屏恢复钳制 ----
 echo "-- 越屏恢复钳制"
 rpc '{"action":"ui.set","args":{"badgePos":{"x":99999,"y":99999}}}' >/dev/null
-agent-browser open "$PAGE_URL" >/dev/null 2>&1; sleep 9
+ab open "$PAGE_URL" >/dev/null 2>&1; sleep 9
 R=$(ev '(function(){var b=document.querySelector(".xq-badge");if(!b)return "NO_BADGE";var r=b.getBoundingClientRect();return (r.left>=0&&r.top>=0&&r.right<=window.innerWidth+1&&r.bottom<=window.innerHeight+1)?"IN_VIEW":"OUT_"+Math.round(r.left)+","+Math.round(r.top)})()')
 [ "$R" = '"IN_VIEW"' ] && pass "越屏位置恢复时钳制回视口" || fail "徽章越屏 ($R)"
 # 钳制落盘（v1.24.1 起钳制修正会持久化）：等 debounce 后 host 不应再存 99999
