@@ -44,7 +44,7 @@
 
 1. 改代码：只改 `dynamic/`，然后 `npm run generate`
 2. 动态模式自测（cordis define/run + 浏览器）
-3. `npm run check`（静态关卡；赶时间可先 `check:fast`，冒烟留给 CI 的 tag 触发）
+3. `npm run check`（**发版人本地 strict 数据关**——CI 数据中心出口 IP 恒被雪球拦截，tag CI 只验证结构关卡 1-5/7 + 离线套件；赶时间可先 `check:fast`，但发版前必须在未被风控拦截的网络跑一次全量）
 4. 版本号 + 双语 changelog → commit → push
 5. `npm publish --registry https://registry.npmjs.org`（prepublishOnly 只跑 check:fast 秒级关卡；
    本机默认 registry 是 npmmirror 镜像，**必须显式指定官方 registry**）

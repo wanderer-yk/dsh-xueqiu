@@ -41,9 +41,11 @@ jobs:
         run: bash scripts/static-smoke.sh
         env:
           SMOKE_PORT: 3199
-          # P0-C：PR 路径数据关卡降级为 warn（上游匿名拦截取决于出口 IP，与插件好坏无关），
-          # 结构关卡仍全数 FAIL；push/tag/schedule 保持 strict——发版必须真实出数
-          SMOKE_LIVE: ${{ github.event_name == 'pull_request' && 'warn' || 'strict' }}
+          # P0-C→1.25.0 修订：CI 数据关卡统一 warn——GitHub 数据中心出口 IP 恒被雪球
+          # 边缘拦截（2026-10-23 tag strict 三连实证 [seed_blocked]），strict 数据关在
+          # CI 不可达成；结构关卡（安装/启动/清单/bundle/栅栏）仍全数 FAIL。
+          # 真实数据验证回归发版人本地：npm run check（strict）。
+          SMOKE_LIVE: warn
 
   # 雪球真实接口契约：无 XQ_COOKIE secret 时自动 skip（push/PR 安全）
   # 每日定时用 secret Cookie 真跑，雪球改接口时这里最先失败（防 watch.json 类事故）
@@ -108,6 +110,7 @@ jobs:
   # 此前只在本机手动跑。browser-interact.sh 已带全新实例兜底（自动点开侧边栏会话）。
   browser-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 25   # agent-browser 在 CI 慢环境可能挂死（本地同版本 3 分钟）——快速失败优于占用 6h
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
