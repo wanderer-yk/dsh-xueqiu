@@ -19,15 +19,36 @@ O="Origin: $BASE_URL"
 # 新版 dsh token 鉴权：E2E_TOKEN 存在时页面导航带 token（消费后种 auth cookie），rpc 直调带 query token
 PAGE_URL="$BASE_URL/"
 RPC_Q=""
-if [ -n "${E2E_TOKEN:-}" ]; then PAGE_URL="$BASE_URL/?token=$E2E_TOKEN"; RPC_Q="?token=$E2E_TOKEN"; fi
+if [ -n "${E2E_TOKEN:-}" ]; then PAGE_URL="$BASE_URL/?token=$E2E_TOKEN"; fi
 
 FAIL=0
 SKIP=0
 pass() { printf '  ✅ %s\n' "$*"; }
 fail() { printf '  ❌ %s\n' "$*"; FAIL=1; }
 skip() { printf '  ⏭️  %s（环境豁免，不计失败）\n' "$*"; SKIP=1; }
-rpc() { curl -s -m 20 -X POST "$BASE_URL/xq-rpc$RPC_Q" -H "$O" -H 'Content-Type: application/json' -d "$1"; }
 ev() { agent-browser eval "$1" 2>/dev/null; }
+# token 鉴权模式（新版 dsh，单次消费语义——2026-10-23 CI 实证）：
+# 浏览器 open PAGE_URL 是唯一一次 token 消费（种 auth cookie），此后 curl 已无凭据可用，
+# rpc() 全部改走页面同源 fetch（借浏览器 cookie 鉴权）。无 token 模式（旧版 dsh/本地）维持 curl。
+# 注意：页内 fetch 由 agent-browser(Playwright) 等待 promise，返回对象直接序列化为 JSON——
+# 与 curl 输出同为可 grep 的 {"ok":...} 形状。
+rpc() {
+  if [ -n "${E2E_TOKEN:-}" ]; then
+    # body 必须 JSON.stringify（fetch 只收字符串，直接传对象会变 "[object Object]"，
+    # 服务端解析出 action:undefined——CI 实测）；输出经 jq -c 压平成与 curl 一致的
+    # 紧凑单行 JSON（agent-browser 对返回对象是 2 空格缩进 pretty 打印，会打断
+    # 脚本里所有 "badgePos":{...} 形状的行内 grep 断言）。jq 缺失时原样透传（弱化但不崩）。
+    local out
+    out=$(ev "(async function(){try{const r=await fetch('/xq-rpc',{method:'POST',headers:{'Content-Type':'application/json','Origin':location.origin},body:JSON.stringify($1)});return await r.json()}catch(e){return {ok:false,error:'E2E_PAGE_FETCH:'+String(e&&e.message||e)}}})()")
+    printf '%s' "$out" | jq -c . 2>/dev/null || printf '%s' "$out"
+  else
+    curl -s -m 20 -X POST "$BASE_URL/xq-rpc" -H "$O" -H 'Content-Type: application/json' -d "$1"
+  fi
+}
+
+# 浏览器必须最先消费 token（在第一次 rpc 之前！）——先开页面种 cookie，再备份状态
+agent-browser open "$PAGE_URL" >/dev/null 2>&1
+sleep 8
 
 # ---- 状态保存/恢复 ----
 SAVED=$(rpc '{"action":"ui.get","args":{}}')
@@ -47,13 +68,11 @@ restore() {
   rpc "{\"action\":\"ui.set\",\"args\":{$(IFS=,; echo "${args[*]}")}}" >/dev/null
   return 0
 }
-trap 'agent-browser close >/dev/null 2>&1; restore >/dev/null 2>&1' EXIT
+trap 'restore >/dev/null 2>&1; agent-browser close >/dev/null 2>&1' EXIT
 
 echo "==> 浏览器交互回归  base=$BASE_URL"
 command -v agent-browser >/dev/null 2>&1 || { echo "❌ 需要 agent-browser"; exit 1; }
 
-agent-browser open "$PAGE_URL" >/dev/null 2>&1
-sleep 8
 
 # ---- 0. 就绪预处理（全新实例专用；本地已引导实例自动跳过）----
 # 两个前置坑（2026-10 实测定位，曾误判为 agent-browser 0.27 mouse API 兼容问题——

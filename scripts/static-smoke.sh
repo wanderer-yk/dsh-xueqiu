@@ -146,18 +146,26 @@ fi
 
 # ---- 5. client bundle ----
 say "-- 5/7 client bundle 格式"
-# bundle 路径从 boot 页面自证提取（src="/plugins/dsh-xueqiu/client.js?rev=..."）——
-# 不同 dsh 版本的资源服务行为有差异（2026-10-23 CI：boot 清单经 cookie 可取、
-# 旧路径直取为空），页面里真实引用的 URL 是权威路径；取不到再回退旧路径。
-BURL=$(printf '%s' "$BOOT" | grep -oE '/plugins/dsh-xueqiu/client\.js[^"\'' ]*' | head -1)
-[ -z "$BURL" ] && BURL="/plugins/dsh-xueqiu/client.js$AUTH"
-BUNDLE=$(curl -s -b "$JAR" "http://127.0.0.1:$PORT$BURL")
-# 注意：不要用 echo|head|grep（pipefail 下 SIGPIPE 会误报），用 bash 字符串匹配
+# 多候选按序试取（2026-10-23 CI 实证版本差异：部分 dsh 对资源路径强制 ?rev=，缺参 404，
+# 本地同路径 200）：① boot 页自证路径 ② 页面其它插件 src 的 rev 参数复用 ③ 带 AUTH 旧路径
+BUNDLE=""
+HIT_URL=""
+TRIED=""
+CAND1=$(printf '%s' "$BOOT" | grep -oE '/plugins/dsh-xueqiu/client\.js[^"'\'' ]*' | head -1)
+[ -n "$CAND1" ] && TRIED="$TRIED 1:$CAND1"
+REV=$(printf '%s' "$BOOT" | grep -oE 'client\.js\?rev=[0-9a-f]+' | head -1 | sed 's/.*rev=//')
+CAND2="/plugins/dsh-xueqiu/client.js"
+[ -n "$REV" ] && CAND2="/plugins/dsh-xueqiu/client.js?rev=$REV"
+for u in "$CAND1" "$CAND2" "/plugins/dsh-xueqiu/client.js$AUTH"; do
+  [ -z "$u" ] && continue
+  B=$(curl -s -b "$JAR" "http://127.0.0.1:$PORT$u")
+  if [[ "$B" == *__ModuleLoader__* ]]; then BUNDLE="$B"; HIT_URL="$u"; break; fi
+  TRIED="$TRIED | $u→$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "http://127.0.0.1:$PORT$u")"
+done
 if [[ "$BUNDLE" == *__ModuleLoader__* ]]; then
-  pass "bundle 是 __ModuleLoader__ 工厂格式"
+  pass "bundle 是 __ModuleLoader__ 工厂格式 (src=$HIT_URL)"
 else
-  BCODE=$(curl -s -o /dev/null -w '%{http_code}' -b "$JAR" "http://127.0.0.1:$PORT$BURL")
-  fail "bundle 缺 __ModuleLoader__.load — 浏览器端会 SyntaxError（url=$BURL code=$BCODE head=$(printf '%s' "$BUNDLE" | head -c 80)）"
+  fail "bundle 缺 __ModuleLoader__.load — 浏览器端会 SyntaxError（尝试=$TRIED head=$(printf '%s' "$B" | head -c 60)）"
 fi
 # P1-A 起传输层是运行时接缝：host.call 合法存在于 typeof host 守卫内（静态环境走不到），
 # 但静态 fetch 分支必须存在（缺了则浏览器端全部 RPC 404/崩）。旧"无 host.call 残留"断言随之废弃。
