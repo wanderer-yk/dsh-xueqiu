@@ -30,7 +30,9 @@ skip() { printf '  ⏭️  %s（环境豁免，不计失败）\n' "$*"; SKIP=1; 
 # 日志停在卡点（2026-10-23 第 6/7 轮 tag CI 实证 17+ 分钟无输出挂起，远程无法内省）。
 # macOS 本地无 timeout 命令时直通（本地全流程 3 分钟，不需要）。
 if command -v timeout >/dev/null 2>&1; then
-  ab() { timeout 60 agent-browser "$@"; }
+  # -k 5：agent-browser(Node CLI) 挂起时常忽略 SIGTERM——无 -k 的 timeout 会陪它等到底
+  # （第 8 轮 CI 实证：60s timeout 形同虚设，job 挂满 24 分钟零输出）
+  ab() { timeout -k 5 60 agent-browser "$@"; }
 else
   ab() { agent-browser "$@"; }
 fi
@@ -54,8 +56,12 @@ rpc() {
   fi
 }
 
+command -v agent-browser >/dev/null 2>&1 || { echo "❌ 需要 agent-browser"; exit 1; }
+
 # 浏览器必须最先消费 token（在第一次 rpc 之前！）——先开页面种 cookie，再备份状态
+echo "-- 打开页面（token 消费点）"
 ab open "$PAGE_URL" >/dev/null 2>&1
+echo "-- 页面已打开，等待应用挂载"
 sleep 8
 
 # ---- 状态保存/恢复 ----
@@ -79,8 +85,6 @@ restore() {
 trap 'restore >/dev/null 2>&1; ab close >/dev/null 2>&1' EXIT
 
 echo "==> 浏览器交互回归  base=$BASE_URL"
-command -v agent-browser >/dev/null 2>&1 || { echo "❌ 需要 agent-browser"; exit 1; }
-
 
 # ---- 0. 就绪预处理（全新实例专用；本地已引导实例自动跳过）----
 # 两个前置坑（2026-10 实测定位，曾误判为 agent-browser 0.27 mouse API 兼容问题——
