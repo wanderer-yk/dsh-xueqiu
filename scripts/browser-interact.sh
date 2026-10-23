@@ -80,13 +80,22 @@ R="NO"
 for i in 1 2 3 4 5 6; do
   R=$(ev 'document.querySelector(".xq-badge") ? "OK" : "NO"')
   [ "$R" = '"OK"' ] && break
+  # 中途兜底：若页面连应用加载器都没有（CI 实证过——boot 探针可能已消费 token，
+  # 浏览器再开同 token 落在无应用内容的页面），第 3 轮起用同 token 重开一次
+  if [ "$i" = 3 ]; then
+    HASLOADER=$(ev 'typeof window.__ModuleLoader__ !== "undefined" ? "yes" : "no"' 2>/dev/null)
+    [ "$HASLOADER" != '"yes"' ] && { agent-browser open "$PAGE_URL" >/dev/null 2>&1; sleep 6; }
+  fi
   sleep 5
 done
 if [ "$R" != '"OK"' ]; then
   echo "     诊断: url=$(ev 'location.href' 2>/dev/null | head -c 80)"
-  echo "     诊断: boot清单含插件=$(ev 'typeof window.__DSH_BOOT__==="object" ? String(JSON.stringify(window.__DSH_BOOT__)).includes("dsh-xueqiu") : "no-boot"' 2>/dev/null)"
+  echo "     诊断: title=$(ev 'document.title' 2>/dev/null | head -c 60)"
+  echo "     诊断: 正文头=$(ev '(document.body.innerText||"").slice(0,60).replace(/\n/g,"|")' 2>/dev/null)"
+  echo "     诊断: boot清单=$(ev 'typeof window.__DSH_BOOT__==="object" ? (String(JSON.stringify(window.__DSH_BOOT__)).includes("dsh-xueqiu") ? "has-plugin" : "no-plugin") : "no-boot"' 2>/dev/null)"
   echo "     诊断: 插件样式标签=$(ev '!!document.querySelector("style[data-plugin=dsh-xueqiu]")' 2>/dev/null)"
   echo "     诊断: 模块加载器=$(ev 'typeof window.__ModuleLoader__ !== "undefined" ? "yes" : "no"' 2>/dev/null)"
+  echo "     诊断: dsh版本=$("$DSH_BIN" --version 2>/dev/null || echo unknown)"
 fi
 [ "$R" = '"OK"' ] && pass "徽章挂载" || { fail "徽章未挂载 ($R)"; exit 1; }
 R=$(ev '(function(){var h=document.querySelector(".xq-badge-hd");return h?getComputedStyle(h).flexDirection:"NO_HD"})()')

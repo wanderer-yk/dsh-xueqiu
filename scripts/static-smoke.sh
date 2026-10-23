@@ -130,7 +130,14 @@ fi
 
 # ---- 4. boot 清单 ----
 say "-- 4/7 __DSH_BOOT__ 清单"
-BOOT=$(curl -s "http://127.0.0.1:$PORT/$AUTH")
+# token 鉴权版：GET /?token= 是 303（消费 token 种 auth cookie 后重定向），curl 不带 -L/cookie
+# 只能拿到空重定向体（2026-10-23 CI 实证：gate 6 RPC 带 query token 能通，页面/资源 GET 必须走
+# cookie）。先消费 token 落 cookie jar，再带 cookie 抓取；旧版（无 token）jar 为空不影响。
+JAR="$TMP/smoke-cookies.txt"
+if [ -n "$TOKEN" ]; then
+  curl -s -L -c "$JAR" -o /dev/null "http://127.0.0.1:$PORT/?token=$TOKEN"
+fi
+BOOT=$(curl -s -b "$JAR" "http://127.0.0.1:$PORT/")
 if echo "$BOOT" | grep -q '"id":"dsh-xueqiu"'; then
   pass "boot 清单含 dsh-xueqiu client 行"
 else
@@ -139,7 +146,7 @@ fi
 
 # ---- 5. client bundle ----
 say "-- 5/7 client bundle 格式"
-BUNDLE=$(curl -s "http://127.0.0.1:$PORT/plugins/dsh-xueqiu/client.js$AUTH")
+BUNDLE=$(curl -s -b "$JAR" "http://127.0.0.1:$PORT/plugins/dsh-xueqiu/client.js$AUTH")
 # 注意：不要用 echo|head|grep（pipefail 下 SIGPIPE 会误报），用 bash 字符串匹配
 if [[ "$BUNDLE" == *__ModuleLoader__* ]]; then
   pass "bundle 是 __ModuleLoader__ 工厂格式"
