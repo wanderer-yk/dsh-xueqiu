@@ -14,18 +14,25 @@
 ## 三层防护（现状）
 
 1. **源码单一真源** — `dynamic/` 是唯一手写源，`src/` 由 `scripts/gen-static.py` 生成。
-   发布前 `--check` 校验无 drift；转换锚点（`styles.insert` / `host.call`）漂移时生成器主动报错。
+   发布前 `--check` 校验无 drift。1.25.0 起动态/静态差异（样式注入与 RPC 传输）改为
+   client 源码内**运行时接缝**（`typeof styles` / `typeof host` 判定），生成器退化为
+   纯包装 + vendored KLineChart 注入，不再做任何文本替换（旧锚点替换要求每次改
+   `call()` 同步改生成器，锚点漂移即失败）。
    ```bash
    npm run generate   # 改完 dynamic/ 后重新生成 src/
    ```
 
 2. **静态冒烟关卡** — `scripts/static-smoke.sh` 在隔离 `DSH_HOME` 临时目录里
    走完整用户路径：`dsh plugin add` → `--dump-config` → 真实启动 → boot 清单 → bundle 格式
-   （含 `host.call` 残留检查）→ `/xq-rpc` 真实行情 → 同源栅栏 403。
+   （含传输接缝存在性检查）→ `/xq-rpc` 真实行情 → 同源栅栏 403。
    已用 v1.7.0 坏代码做过负向验证：第 3 步必然失败。
+   数据关卡分级（P0-C）：`SMOKE_LIVE=strict`（默认，本地/发版 tag）上游错误一律 FAIL；
+   `SMOKE_LIVE=warn`（CI PR 路径）上游风控类错误降级为 UPSTREAM_BLOCKED 警告——
+   匿名通道是否被雪球边缘拦截取决于出口 IP，与插件好坏无关（2026-10-22 实测教训）。
    ```bash
-   bash scripts/static-smoke.sh              # 无浏览器，CI 可跑
-   SMOKE_BROWSER=1 bash scripts/static-smoke.sh   # 本机可追加浏览器徽章检查
+   bash scripts/static-smoke.sh                    # 无浏览器，strict
+   SMOKE_LIVE=warn bash scripts/static-smoke.sh    # 上游错误降级为警告
+   SMOKE_BROWSER=1 bash scripts/static-smoke.sh    # 本机可追加浏览器徽章检查
    ```
 
 3. **发布钩子 + CI** — `npm publish` 前自动跑 `npm run check:fast`（drift + 语法，秒级、本地不起服务）；

@@ -4,14 +4,20 @@
 单一真源约定：
   - dynamic/host.js、dynamic/client.js 是唯一手写源（函数体形式）。
   - src/index.js     = dynamic/host.js 包上 `export default {...}`
-  - src/client/index.js = dynamic/client.js 包上 __ModuleLoader__ CJS 工厂，
-    并做两个模式替换（styles.insert→insertStyle；host.call→同源 fetch /xq-rpc）。
+  - src/client/index.js = dynamic/client.js 包上 __ModuleLoader__ CJS 工厂 + 注入
+    vendored KLineChart UMD。
+
+P1-A 起 gen-static 不再做任何文本替换：动态/静态的差异（styles.insert 与 host.call
+传输层）已改为 client 源码内的运行时接缝（typeof styles / typeof host 判定），
+本脚本退化为「纯包装 + KLC 注入 + drift 校验」。旧方案的 DYNAMIC_CALL/STATIC_CALL
+整函数文本替换要求每次改 call() 同步改本脚本，锚点漂移即失败——运行时接缝消除了
+这一整类维护负担（代价仅是静态 bundle 多带一个死分支，体积可忽略）。
 
 用法：
   python3 scripts/gen-static.py          # 生成并校验（drift 时退出码 1，先重写文件）
   python3 scripts/gen-static.py --check  # 只校验，不写文件（CI 用）
 """
-import sys, os, pathlib
+import sys, pathlib
 
 root = pathlib.Path(__file__).resolve().parent.parent
 check_only = '--check' in sys.argv
@@ -30,62 +36,18 @@ if not client_body.startswith('return {'):
 
 # ---- host: export default 包装（函数体顶层 return 换成 export default）----
 # 注意：不注入任何宿主包 import —— file: 安装不会安装 peer 依赖，顶层 import
-# 会直接 ERR_MODULE_NOT_FOUND 崩掉宿主。agent 工具注册见 host 尾部 xqDefineTool：
-# 动态环境用 harness.defineTool，静态环境在运行时从宿主进程解析 dsh-tools，再退回 plain。
-assert host_body.startswith('return {')
+# 会直接 ERR_MODULE_NOT_FOUND 崩掉宿主。
 host_static = 'export default {' + host_body[len('return {'):] + '\n'
 
-# ---- client: CJS 工厂 + 两个模式替换 ----
-if "styles.insert(" not in client_body:
-    die('dynamic/client.js 缺少 styles.insert —— 转换锚点漂移，请更新本脚本')
-
-# call() 传输层函数级替换：dynamic 用 host.call + race 看门狗；静态版必须是同源 fetch 的
-# 完整实现（AbortSignal 超时 + 老 WebView race 兜底 + res.ok + JSON 解析防护）。
-# 注意不能做单行 `await host.call(...)` 字面替换——race 数组里的 await 会先于 race 执行，
-# 看门狗将完全失效（fetch 永挂时到不了 race）。两份函数文本必须同步演进。
-DYNAMIC_CALL = """    async function call(action, args) {
-      // host.call 无内建超时：race 15s 看门狗，host 卡住时面板不能永久假死
-      let t
-      const watchdog = new Promise(function (_, rej) { t = setTimeout(function () { rej(new Error('host 调用超时 (15s)')) }, 15000) })
-      const r = await Promise.race([host.call('xq.call', { action: action, args: args || {} }), watchdog]).finally(function () { clearTimeout(t) })
-      if (!r || !r.ok) throw new Error((r && r.error) || '调用失败')
-      return r.data
-    }"""
-STATIC_CALL = """    async function call(action, args) {
-      // 超时 + 状态检查：host 卡住时不能让面板永久假死；非 JSON/5xx 给可读错误
-      // AbortSignal.timeout 需 Chrome 103+/Safari 16+；老 WebView 缺失时退回 race 看门狗（不能永挂也不能全挂）
-      let res
-      if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
-        try {
-          res = await fetch('/xq-rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action, args: args || {} }), signal: AbortSignal.timeout(15000) })
-        } catch (e) {
-          if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) throw new Error('请求超时 (15s)')
-          throw e
-        }
-      } else {
-        let t
-        const watchdog = new Promise(function (_, rej) { t = setTimeout(function () { rej(new Error('请求超时 (15s)')) }, 15000) })
-        res = await Promise.race([
-          fetch('/xq-rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action, args: args || {} }) }),
-          watchdog
-        ]).finally(function () { clearTimeout(t) })
-      }
-      if (!res.ok) throw new Error('请求失败 (HTTP ' + res.status + ')')
-      let r
-      try { r = await res.json() } catch (e) { throw new Error('响应不是有效 JSON（host 异常）') }
-      if (!r || !r.ok) throw new Error((r && r.error) || '调用失败')
-      return r.data
-    }"""
-if DYNAMIC_CALL not in client_body:
-    die("dynamic/client.js 缺少 host.call 版 call() 函数（锚点漂移）—— 请同步更新本脚本的 DYNAMIC_CALL/STATIC_CALL")
-
-c = client_body.replace("styles.insert(", "insertStyle(")
-c = c.replace(DYNAMIC_CALL, STATIC_CALL)
-if 'host.call' in c:
-    die('静态版 client 仍残留 host.call —— 替换未生效')
+# ---- client: 接缝自检（静态形态依赖的两个运行时判定必须在源码里）----
+if 'typeof styles' not in client_body:
+    die('dynamic/client.js 缺少 styles 运行时接缝（typeof styles）—— 接缝被移除了吗？')
+if "typeof host !== 'undefined'" not in client_body:
+    die('dynamic/client.js 缺少 host 传输接缝（typeof host）—— 接缝被移除了吗？')
+if '/xq-rpc' not in client_body:
+    die('dynamic/client.js 缺少静态传输目标 /xq-rpc —— fetch 分支被移除了吗？')
 # 函数体顶层 return {...} → exports.default = {...}（loader 取 exports.default ?? exports）
-assert c.startswith('return {')
-c = 'exports.default = {' + c[len('return {'):]
+c = 'exports.default = {' + client_body[len('return {'):]
 
 # ---- vendored KLineChart UMD（Apache-2.0）----
 # 注入 factory 头部：遮蔽 module/exports/define 使 UMD 走 global 分支挂 window.klinecharts。
@@ -101,22 +63,13 @@ klc_inject = (
 
 client_static = '''// 由 scripts/gen-static.py 从 dynamic/client.js 生成 —— 勿手改；改 dynamic/ 后重新生成。
 // 静态 bundle 格式：classic script 注册到 __ModuleLoader__，factory 为 CJS 形式。
+// 动态/静态差异（样式注入与 RPC 传输）由源码内运行时接缝处理，本文件不做文本替换。
 window.__ModuleLoader__.load({
   id: 'dsh-xueqiu',
   factory: function (require) {
     var module = { exports: {} }
     var exports = module.exports
     const React = require('react')
-
-    // 动态运行时 styles.insert 的替代：自管 <style> 标签（随插件停用移除交给卸载流程）
-    let _styleTag = null
-    function insertStyle (css) {
-      if (typeof document === 'undefined' || !document.head) return
-      _styleTag = document.createElement('style')
-      _styleTag.setAttribute('data-plugin', 'dsh-xueqiu')
-      _styleTag.textContent = css
-      document.head.appendChild(_styleTag)
-    }
 
 ''' + klc_inject + c + '''
     return module.exports

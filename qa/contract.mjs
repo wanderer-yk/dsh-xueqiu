@@ -15,7 +15,11 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 const BASE = 'https://stock.xueqiu.com'
-const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+// UA 单一真源：从 dynamic/host.js 提取——契约测试自称"与插件相同请求路径"，
+// 旧硬编码 Chrome/126 曾与实现的 Chrome/120 漂移（评审发现），测试保真度打折。
+const UA_MATCH = /const UA = '([^']+)'/.exec(readFileSync(new URL('../dynamic/host.js', import.meta.url), 'utf8'))
+if (!UA_MATCH) { console.error('❌ host.js 中未找到 UA 常量（锚点漂移）'); process.exit(1) }
+const UA = UA_MATCH[1]
 
 // ---- Cookie 解析 ----
 // 多候选探测：插件实际写入的位置由运行时 workspaceRoot 决定（随会话变化），

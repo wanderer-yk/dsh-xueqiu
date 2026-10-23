@@ -34,11 +34,16 @@ jobs:
           node qa/state-paths.mjs
           node qa/vol-units.mjs
           node qa/fence.mjs
+          node qa/client-pure.mjs
+          node qa/cache.mjs
+          node qa/client-bundle.mjs
       - name: Static install smoke (real user path)
         run: bash scripts/static-smoke.sh
         env:
           SMOKE_PORT: 3199
-          SMOKE_CI: 1
+          # P0-C：PR 路径数据关卡降级为 warn（上游匿名拦截取决于出口 IP，与插件好坏无关），
+          # 结构关卡仍全数 FAIL；push/tag/schedule 保持 strict——发版必须真实出数
+          SMOKE_LIVE: ${{ github.event_name == 'pull_request' && 'warn' || 'strict' }}
 
   # 雪球真实接口契约：无 XQ_COOKIE secret 时自动 skip（push/PR 安全）
   # 每日定时用 secret Cookie 真跑，雪球改接口时这里最先失败（防 watch.json 类事故）
@@ -58,7 +63,8 @@ jobs:
         run: node qa/live.mjs
 
   # Windows 支持：DSH win32 层 shell 为 PowerShell。curl.exe 显式调用绕开 PS 5.1 的
-  # Invoke-WebRequest 别名；live.mjs 走 pwsh realShell 真连雪球（含匿名 Cookie 播种链路）。
+  # Invoke-WebRequest 别名；离线套件每次 PR 全量跑，live.mjs（pwsh 真连雪球含匿名
+  # Cookie 播种链路）只在每日定时/手动触发——匿名通道被出口 IP 拦截与插件好坏无关。
   windows:
     runs-on: windows-latest
     steps:
@@ -81,11 +87,18 @@ jobs:
           node qa/state-paths.mjs
           node qa/vol-units.mjs
           node qa/fence.mjs
+          node qa/client-pure.mjs
+          node qa/cache.mjs
+          node qa/client-bundle.mjs
       - name: Live API test via pwsh shell (real Xueqiu, anonymous)
+        # P0-C：真连雪球的 live 步骤只在每日定时/手动触发跑——PR 上匿名通道被出口 IP
+        # 风控拦截时会掩盖真正的结构性回归；离线套件（上方）每次 PR 仍全量跑
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: node qa/live.mjs
       # 真 Win10 老用户环境：DSH win32 层在无 pwsh 7 时回退 powershell.exe(5.1)。
       # XQ_FORCE_PS51=1 强制测试桩走同款回退 + UTF-8 编码声明（5.1 OEM 代码页防中文乱码）。
       - name: Live API test via Windows PowerShell 5.1 fallback (real Xueqiu)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: node qa/live.mjs
         env:
           XQ_FORCE_PS51: '1'
@@ -113,3 +126,17 @@ jobs:
           WORKSPACE_DIR: /tmp/xq-e2e-home/ws
           E2E_PLUGIN_DIR: ${{ github.workspace }}
           E2E_PORT: '3210'
+
+  # 播种链路纵向观测（P0-A 遗留项的证据采集）：每日从 GitHub 出口 IP 跑探针，
+  # 记录候选 URL × 头组合的 set-cookie 返回。探针恒 exit 0（信息性，不做门禁）——
+  # 数据用于 seedUrls 扩容决策（2026-10-22 本机网络全候选被拦，无法本地取证）。
+  seed-probe:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Seed endpoint probe (informational, always exit 0)
+        run: node qa/probe-seed.mjs

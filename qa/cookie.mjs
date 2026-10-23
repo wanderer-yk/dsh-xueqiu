@@ -109,5 +109,75 @@ console.log('== C1 种子回退链 ==')
   ok(hqHits <= 1, '并发播种去重 (hq 访问 ' + hqHits + ' 次)')
 }
 
+console.log('== C2 匿名 cookie 落盘复用（P0-B）==')
+// 捕获 cmd/stdin 的 shell（断言 cookie 走 stdin、种子零调用需要看完整命令）
+function spyShell(perUrl) {
+  const calls = []
+  return {
+    calls,
+    resolve: (s) => s,
+    run: async (spec) => {
+      const url = (spec.command.match(/'(https:[^']+)'/) || [])[1] || ''
+      calls.push({ url, cmd: spec.command, stdin: spec.stdin })
+      const rule = perUrl.find((p) => url.includes(p.match))
+      const text = !rule ? '' : (typeof rule.text === 'function' ? rule.text(calls.length) : rule.text)
+      if (rule && rule.exit !== undefined) return { exitCode: rule.exit, stdout: { text: '' }, stderr: { text: 'fail' } }
+      return { exitCode: 0, stdout: { text }, stderr: { text: '' } }
+    },
+  }
+}
+const QUOTE_OK = JSON.stringify({ data: { items: [{ market: { status_id: 1 }, quote: { symbol: 'SH600519', current: 1 } }] } })
+async function boot(files, perUrl) {
+  const plugin = loadPlugin()
+  const shell = spyShell(perUrl)
+  const ctx = makeCtx({ shell, files })
+  let h; globalThis.harness = { handle: (m, f) => { h = f; return () => {} }, registerTool: () => () => {}, defineTool: (s) => s }
+  plugin.apply(ctx); delete globalThis.harness
+  return { h, shell, ctx }
+}
+{
+  // 1. 播种成功 → 匿名 cookie 落盘（.xueqiu-anon.json）
+  const { h, ctx } = await boot({}, [
+    { match: 'xueqiu.com/hq', text: seedOk(FULL) },
+    { match: 'batch/quote', text: QUOTE_OK },
+  ])
+  await h({ action: 'quote', args: { symbols: 'SH600519' } })
+  const f = ctx.__files['.xueqiu-anon.json']
+  ok(f && f.includes('xq_a_token=token123'), '播种成功后匿名 cookie 落盘')
+}
+{
+  // 2. 冷启动复用：盘上有上次的好 cookie → 零种子请求、数据请求带文件 cookie
+  const { h, shell } = await boot({ '.xueqiu-anon.json': JSON.stringify({ cookie: 'acw_tc=z; xq_a_token=filetoken; u=42', at: 1 }) }, [
+    { match: 'batch/quote', text: QUOTE_OK },
+  ])
+  const r = await h({ action: 'quote', args: { symbols: 'SH600519' } })
+  ok(r.ok, '文件 cookie 直接出数')
+  ok(shell.calls.filter((c) => /xueqiu\.com\/hq|www\.xueqiu\.com\/$/.test(c.url)).length === 0, '冷启动零种子请求（免播种）')
+  const data = shell.calls.filter((c) => c.url.includes('batch/quote'))
+  ok(data.every((c) => (c.stdin || '').includes('xq_a_token=filetoken') && c.cmd.includes('-H @-')), '数据请求带文件 cookie（stdin 注入）')
+}
+{
+  // 3. 毒化文件（无 xq_a_token）→ 弃用回退播种
+  const { h, shell } = await boot({ '.xueqiu-anon.json': JSON.stringify({ cookie: 'u=999' }) }, [
+    { match: 'xueqiu.com/hq', text: seedOk(FULL) },
+    { match: 'batch/quote', text: QUOTE_OK },
+  ])
+  const r = await h({ action: 'quote', args: { symbols: 'SH600519' } })
+  ok(r.ok && shell.calls.some((c) => c.url.includes('/hq')), '毒化文件被弃用（回退播种）')
+}
+{
+  // 4. 文件 cookie 失效（400016）→ force 重播种绕过文件 → 自愈并覆盖落盘
+  let n = 0
+  const { h, shell, ctx } = await boot({ '.xueqiu-anon.json': JSON.stringify({ cookie: 'xq_a_token=stalefile; u=1' }) }, [
+    { match: 'xueqiu.com/hq', text: seedOk(['xq_a_token=fresh456', 'u=7']) },
+    { match: 'batch/quote', text: () => (n++ === 0 ? '{"error_code":400016,"error_description":"Cookie 失效"}' : QUOTE_OK) },
+  ])
+  const r = await h({ action: 'quote', args: { symbols: 'SH600519' } })
+  ok(r.ok, '文件 cookie 失效后重播种自愈成功')
+  ok(shell.calls.some((c) => c.url.includes('/hq')), '失效触发重播种（force 绕过盘上旧值）')
+  const f = ctx.__files['.xueqiu-anon.json']
+  ok(f && f.includes('xq_a_token=fresh456') && !f.includes('stalefile'), '重播种成功覆盖落盘新 token')
+}
+
 console.log('\n' + (fail === 0 ? '✅' : '❌') + ` cookie: ${pass} passed, ${fail} failed`)
 process.exit(fail === 0 ? 0 : 1)

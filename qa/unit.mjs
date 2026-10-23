@@ -204,11 +204,21 @@ console.log('== U1 调度与缓存 ==')
   ok(shell.calls.filter((c) => (c.url || '').includes('kline.json')).length === 0, '空 symbol 不发起上游 kline 请求')
 }
 {
-  // cookie_expired 降级：登录态 400016 → 匿名重试
+  // cookie_expired 降级：登录态 400016 → 匿名重试（先 watchlist.get 触发 loadLogin——
+  // 直接 quote 不会加载登录文件，旧测试的"登录态"实为匿名路径）
   let n = 0
   const { call } = await fresh([{ match: 'batch/quote', body: () => (n++ === 0 ? '{"error_code":400016,"error_description":"Cookie 失效"}' : quoteBody('SH600519', 7)) }], { '.xueqiu-login.json': JSON.stringify({ cookie: 'xq_a_token=bad' }) })
+  await call('watchlist.get', {})   // 触发 loadLogin（portfolio mock 默认空响应 → 空云列表，不镜像）
   const r = await call('quote', { symbols: 'SH600519' })
   ok(r.ok && r.data.list[0].current === 7, 'cookie_expired 自动重试成功')
+}
+{
+  // seed_blocked 短路（P0-A）：匿名 + 播种失败（种子 URL 空响应）+ 400016 →
+  // 不再空转重试 2 轮（旧行为共打 3 次上游），首轮即转译为可操作的 seed_blocked
+  const { call, shell } = await fresh([{ match: 'batch/quote', body: () => '{"error_code":400016,"error_description":"Cookie 失效"}' }])
+  const r = await call('quote', { symbols: 'SH600519' })
+  ok(!r.ok && /seed_blocked|匿名 Cookie 获取失败/.test(r.error), 'seed_blocked 快速失败且文案含登录引导 [' + String(r.error || '').slice(0, 50) + ']')
+  ok(shell.calls.filter((c) => c.url.includes('batch/quote')).length === 1, 'seed_blocked 不空转重试（上游=1，旧行为 3）')
 }
 {
   // rate_limited 退避后成功
@@ -292,6 +302,18 @@ const STKSJ = (syms) => JSON.stringify({ error_code: 0, data: { stocks: syms.map
   // 手动 pull：未登录明确报错
   const { call } = await fresh([])
   await rejects(() => call('watchlist.pull'), /未登录/, 'pull 未登录报错')
+}
+{
+  // 手动 pull 去重（P2）：同步成功且已拿到云端列表时不再二次拉取（旧实现无条件重拉 2 个请求）
+  const files = { '.xueqiu-login.json': JSON.stringify({ cookie: 'xq_a_token=t; u=1' }), '.xueqiu-watchlist.json': WLSJ(['SH600519']) }
+  const { call, shell } = await fresh([
+    { match: 'portfolio/list', body: PLSJ() },
+    { match: 'portfolio/stock/list', body: STKSJ(['SH600519']) },
+  ], files)
+  const r = await call('watchlist.pull')
+  ok(r.ok && r.data.symbols.length === 1, 'pull 成功返回镜像列表')
+  const pfCalls = shell.calls.filter((c) => c.url.includes('portfolio'))
+  ok(pfCalls.length === 2, 'pull 单轮同步只打 2 个 portfolio 请求（list+stock/list，无重复） [' + pfCalls.length + ']')
 }
 
 console.log('== U4 登录校验 ==')

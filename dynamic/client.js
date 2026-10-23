@@ -1,7 +1,17 @@
 return {
   inject: ['timer'],
   apply(ctx) {
-    styles.insert('\n' +
+    // 样式注入接缝（P1-A）：动态运行时用宿主 styles 服务；静态 bundle 自管 <style> 标签
+    // （随插件停用移除交给卸载流程）。运行时判定取代 gen-static.py 的文本替换。
+    function insertCss(css) {
+      if (typeof styles !== 'undefined' && styles && typeof styles.insert === 'function') { styles.insert(css); return }
+      if (typeof document === 'undefined' || !document.head) return
+      const tag = document.createElement('style')
+      tag.setAttribute('data-plugin', 'dsh-xueqiu')
+      tag.textContent = css
+      document.head.appendChild(tag)
+    }
+    insertCss('\n' +
       '.xq-tv-shell{border:1px solid var(--dsw-alias-border-l1);border-radius:10px;padding:8px 10px;margin:4px 0;font-size:13px;line-height:1.5;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);min-width:0;}\n' +
       '.xq-tv-head{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:6px;}\n' +
       '.xq-tv-title{font-weight:700;}\n' +
@@ -188,61 +198,75 @@ return {
 
     function el(type, props, children) { return React.createElement(type, props, children) }
 
-    // ---- 指数轮询共享层：面板(20s)/徽章(30s)/指数条(30s) 三组件合并为单请求流 ----
+    // ---- 指数轮询共享层（面板 20s/徽章 30s/指数条 30s 合并为单请求流）----
     // 收益：同一组 4 指数的上游请求从每 20-30s ×3 份降为每 20s ×1 份（host 的 10s TTL 恰好不命中，
     // 合并前三组件各自真实打满上游）。语义保持：页面隐藏暂停、回前台立即刷新（5s 节流防抖）、
     // in-flight 去重（多订阅者同时回前台只打一次）、卸载退订（最后一个退订停表）。
-    const indexPoll = { subs: new Set(), timer: null, data: null, status: null, at: 0, inflight: null, visOn: false }
+    // 实现是 pure-helpers 区的 makeIndexPoll 工厂（P1-B：依赖全注入，qa/client-pure.mjs 直测）。
     const INDEX_SYMBOLS = ['SH000001', 'SZ399001', 'SZ399006', 'SH000688']
-    function indexPollFetch() {
-      if (indexPoll.inflight) return indexPoll.inflight
-      indexPoll.inflight = call('quote', { symbols: INDEX_SYMBOLS }).then(function (data) {
-        indexPoll.data = (data && data.list) || []
-        indexPoll.status = data ? data.status : null
-        indexPoll.at = Date.now()
-        indexPoll.subs.forEach(function (fn) { try { fn(indexPoll.data, indexPoll.status) } catch (e) { /* 单个订阅者异常不殃及池 */ } })
-      }).catch(function () { /* 静默：保留上次数据，下个 tick 重试 */ }).then(function () { indexPoll.inflight = null })
-      return indexPoll.inflight
-    }
-    function indexPollTick() {
-      if (!indexPoll.subs.size || pageHidden()) return
-      indexPollFetch()
-    }
-    function indexPollVis() {
-      if (!pageHidden() && indexPoll.subs.size && Date.now() - indexPoll.at > 5000) indexPollFetch()
-    }
-    function subscribeIndices(fn) {
-      const first = indexPoll.subs.size === 0
-      indexPoll.subs.add(fn)
-      if (indexPoll.data) { try { fn(indexPoll.data, indexPoll.status) } catch (e) { /* ignore */ } }   // 新订阅者立即回放缓存
-      if (first) {
-        if (!indexPoll.at || Date.now() - indexPoll.at > 20000) indexPollFetch()
-        if (!indexPoll.timer) indexPoll.timer = ctx.interval(indexPollTick, 20000)
-        if (!indexPoll.visOn) {
-          indexPoll.visOn = true
-          try { document.addEventListener('visibilitychange', indexPollVis) } catch (e) { /* ignore */ }
-        }
-      }
-      return function () {
-        indexPoll.subs.delete(fn)
-        if (!indexPoll.subs.size) {
-          if (indexPoll.timer) { indexPoll.timer(); indexPoll.timer = null }
-          if (indexPoll.visOn) {
-            indexPoll.visOn = false
-            try { document.removeEventListener('visibilitychange', indexPollVis) } catch (e) { /* ignore */ }
-          }
-        }
-      }
-    }
+    const subscribeIndices = makeIndexPoll({
+      call: call,
+      symbols: INDEX_SYMBOLS,
+      interval: function (fn, ms) { return ctx.interval(fn, ms) },
+      hidden: pageHidden,
+      now: function () { return Date.now() },
+      listenVis: function (fn) {
+        try {
+          document.addEventListener('visibilitychange', fn)
+          return function () { try { document.removeEventListener('visibilitychange', fn) } catch (e) { /* ignore */ } }
+        } catch (e) { return function () { /* 无 document 环境 */ } }
+      },
+    })
 
+    // 传输接缝（P1-A）：动态运行时存在全局 host 门面 → host.call + race 看门狗；
+    // 静态 bundle 无 host → 同源 fetch /xq-rpc（AbortSignal 超时 + 老 WebView race 兜底）。
+    // 两分支在同一份源码里按运行时判定选择——gen-static.py 从此只做包装不做文本替换
+    // （旧方案每次改 call() 都要同步维护生成器里的两份函数文本，锚点漂移即失败）。
+    // ---- qa-extract-begin: transport-call ----
     async function call(action, args) {
-      // host.call 无内建超时：race 15s 看门狗，host 卡住时面板不能永久假死
-      let t
-      const watchdog = new Promise(function (_, rej) { t = setTimeout(function () { rej(new Error('host 调用超时 (15s)')) }, 15000) })
-      const r = await Promise.race([host.call('xq.call', { action: action, args: args || {} }), watchdog]).finally(function () { clearTimeout(t) })
+      // 动态门面判定加 host.call !== Function.prototype.call：任何"恰好叫 host 的全局函数"
+      // 都满足 typeof host.call === 'function'（函数必有 .call 即 Function.prototype.call），
+      // 静态环境出现同名全局时会走错分支把 RPC 发进垃圾调用。真门面的 .call 是自有方法。
+      if (typeof host !== 'undefined' && host && typeof host.call === 'function' && host.call !== Function.prototype.call) {
+        // host.call 无内建超时：race 15s 看门狗，host 卡住时面板不能永久假死
+        let t
+        const watchdog = new Promise(function (_, rej) { t = setTimeout(function () { rej(new Error('host 调用超时 (15s)')) }, 15000) })
+        const r = await Promise.race([host.call('xq.call', { action: action, args: args || {} }), watchdog]).finally(function () { clearTimeout(t) })
+        if (!r || !r.ok) throw new Error((r && r.error) || '调用失败')
+        return r.data
+      }
+      // 超时 + 状态检查：host 卡住时不能让面板永久假死；非 JSON/5xx 给可读错误
+      // AbortSignal.timeout 需 Chrome 103+/Safari 16+；老 WebView 缺失时退回 race 看门狗（不能永挂也不能全挂）
+      let res
+      if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+        try {
+          res = await fetch('/xq-rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action, args: args || {} }), signal: AbortSignal.timeout(15000) })
+        } catch (e) {
+          if (e && (e.name === 'TimeoutError' || e.name === 'AbortError')) throw new Error('请求超时 (15s)')
+          throw e
+        }
+      } else {
+        let t
+        const watchdog = new Promise(function (_, rej) { t = setTimeout(function () { rej(new Error('请求超时 (15s)')) }, 15000) })
+        res = await Promise.race([
+          fetch('/xq-rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: action, args: args || {} }) }),
+          watchdog
+        ]).finally(function () { clearTimeout(t) })
+      }
+      if (!res.ok) throw new Error('请求失败 (HTTP ' + res.status + ')')
+      let r
+      try { r = await res.json() } catch (e) { throw new Error('响应不是有效 JSON（host 异常）') }
       if (!r || !r.ok) throw new Error((r && r.error) || '调用失败')
       return r.data
     }
+    // ---- qa-extract-end: transport-call ----
+
+    // ---- qa-extract-begin: pure-helpers ----
+    // 本区为纯逻辑（不触碰 React/host/call 等运行时全局，依赖均以参数注入）。
+    // qa/client-pure.mjs 按标记整段提取后 new Function 求值直测——比按函数名做
+    // 花括号配对提取稳健（vol-units 旧法对源码格式敏感），也让 2200 行 client 的
+    // 纯逻辑层有了与 host 对等的离线单测（评审：client 侧测试真空是最大 QA 缺口）。
+    function pad2(n) { return n < 10 ? '0' + n : String(n) }
 
     function fmt(v, d) {
       if (v === null || v === undefined || v === '') return '--'
@@ -283,20 +307,13 @@ return {
       // 兼容毫秒数字与可解析字符串（NewsTab created_at 两形态）；无效输入显示 '--' 而非 NaN:NaN:NaN
       const d = new Date(typeof ts === 'number' ? ts : /^\d+$/.test(String(ts)) ? Number(ts) : Date.parse(ts))
       if (isNaN(d.getTime())) return '--:--:--'
-      function p(n) { return n < 10 ? '0' + n : String(n) }
-      return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds())
+      return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds())
     }
+    // fmtFullDay 曾与 fmtDay 逐字节相同（评审发现的重复定义），已合并
     function fmtDay(ts) {
       if (!ts) return ''
       const d = new Date(Number(ts))
-      function p(n) { return n < 10 ? '0' + n : String(n) }
-      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
-    }
-    function fmtFullDay(ts) {
-      if (!ts) return ''
-      const d = new Date(Number(ts))
-      function p(n) { return n < 10 ? '0' + n : String(n) }
-      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
+      return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate())
     }
     function colorOf(pct) {
       if (pct === null || pct === undefined) return 'xq-flat'
@@ -318,10 +335,10 @@ return {
     }
 
     // 交易时段：本地 Intl 时区判定（不含节假日，仅供参考）
-    // segs: [[开盘分,收盘分],...]；lunch: [午休起,午休止]（可选）
-    function sessionState(tz, segs, lunch) {
+    // segs: [[开盘分,收盘分],...]；lunch: [午休起,午休止]（可选）；nowDate 可注入（测试确定性）
+    function sessionState(tz, segs, lunch, nowDate) {
       try {
-        var now = new Date()
+        var now = nowDate || new Date()
         var f = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: false, weekday: 'short', hour: '2-digit', minute: '2-digit' })
         var p = {}
         f.formatToParts(now).forEach(function (x) { p[x.type] = x.value })
@@ -334,14 +351,125 @@ return {
         return cur < segs[0][0] ? '盘前' : '休市'
       } catch (e) { return '' }
     }
-    function aSession() { return sessionState('Asia/Shanghai', [[570, 690], [780, 900]], [690, 780]) }
-    function hkSession() { return sessionState('Asia/Hong_Kong', [[570, 720], [780, 960]], [720, 780]) }
-    function usSession() { return sessionState('America/New_York', [[570, 960]], null) }
-    function sessionsText() {
-      var a = aSession(), hk = hkSession(), us = usSession()
+    function aSession(nowDate) { return sessionState('Asia/Shanghai', [[570, 690], [780, 900]], [690, 780], nowDate) }
+    function hkSession(nowDate) { return sessionState('Asia/Hong_Kong', [[570, 720], [780, 960]], [720, 780], nowDate) }
+    function usSession(nowDate) { return sessionState('America/New_York', [[570, 960]], null, nowDate) }
+    function sessionsText(nowDate) {
+      var a = aSession(nowDate), hk = hkSession(nowDate), us = usSession(nowDate)
       if (!a && !hk && !us) return ''
       return [a && 'A股' + a, hk && '港股' + hk, us && '美股' + us].filter(Boolean).join(' · ')
     }
+    // 按标的代码判所属市场是否开市：SH/SZ/BJ → A股真实 status；4-5 位纯数字 → 港股；其余 → 美股。
+    // 港美股无共享状态源退回时区推算（假日空转可接受：数据不变，仅多几个被 TTL 吞掉的请求）。
+    function sessionOpenFor(symbol, aOpenRef, nowDate) {
+      if (/^(SH|SZ|BJ)/.test(symbol)) return !!(aOpenRef && aOpenRef.current)
+      if (/^[0-9]{4,5}$/.test(symbol)) return hkSession(nowDate) === '盘中'
+      return usSession(nowDate) === '盘中'
+    }
+
+    // K线行归一化：面板行为 {timestamp(ms),open,high,low,close,volume}；卡片行为 {time(ISO),...} → 补 timestamp
+    function klcNormRows(rows) {
+      return (rows || []).map(function (r) {
+        if (r.timestamp) return r
+        const t = r.time ? Date.parse(r.time) : NaN
+        return Object.assign({}, r, { timestamp: isNaN(t) ? 0 : t })
+      }).filter(function (r) { return r.timestamp > 0 })
+    }
+
+    function klcPrecision(rows, hint) {
+      if (hint != null) return hint
+      try {
+        const s = String(rows.length ? rows[rows.length - 1].close : '')
+        const d = (s.split('.')[1] || '').length
+        return Math.max(0, Math.min(4, d || 2))
+      } catch (e) { return 2 }
+    }
+
+    // 指数轮询共享层工厂（原为模块级单例直接引用 call/ctx/document——工厂化依赖全注入，行为逐行保持）：
+    // deps = { call, symbols, interval(fn,ms)->stop, hidden()->bool, now()->ms, listenVis(fn)->off }
+    function makeIndexPoll(deps) {
+      const doCall = deps.call
+      const interval = deps.interval
+      const hidden = deps.hidden
+      const now = deps.now || function () { return Date.now() }
+      const symbols = deps.symbols || []
+      const listenVis = deps.listenVis || function () { return function () { /* 无可见性源 */ } }
+      const st = { subs: new Set(), timer: null, data: null, status: null, at: 0, inflight: null, visOn: false, visOff: null }
+      function fetch() {
+        if (st.inflight) return st.inflight
+        st.inflight = doCall('quote', { symbols: symbols }).then(function (data) {
+          st.data = (data && data.list) || []
+          st.status = data ? data.status : null
+          st.at = now()
+          st.subs.forEach(function (fn) { try { fn(st.data, st.status) } catch (e) { /* 单个订阅者异常不殃及池 */ } })
+        }).catch(function () { /* 静默：保留上次数据，下个 tick 重试 */ }).then(function () { st.inflight = null })
+        return st.inflight
+      }
+      function tick() {
+        if (!st.subs.size || hidden()) return
+        fetch()
+      }
+      function vis() {
+        if (!hidden() && st.subs.size && now() - st.at > 5000) fetch()
+      }
+      return function subscribe(fn) {
+        const first = st.subs.size === 0
+        st.subs.add(fn)
+        if (st.data) { try { fn(st.data, st.status) } catch (e) { /* ignore */ } }   // 新订阅者立即回放缓存
+        if (first) {
+          if (!st.at || now() - st.at > 20000) fetch()
+          if (!st.timer) st.timer = interval(tick, 20000)
+          if (!st.visOn) { st.visOn = true; st.visOff = listenVis(vis) }
+        }
+        return function () {
+          st.subs.delete(fn)
+          if (!st.subs.size) {
+            if (st.timer) { st.timer(); st.timer = null }
+            if (st.visOn) {
+              st.visOn = false
+              try { if (st.visOff) { st.visOff(); st.visOff = null } } catch (e) { /* ignore */ }
+            }
+          }
+        }
+      }
+    }
+
+    // 共享 UI 状态仓库工厂：persist() 为防抖落盘。水合前用户已交互过的字段不做回滚
+    // （页面刚加载就点开面板/切标签，不被迟到的旧持久化打回）。
+    function makeUiStore(persist) {
+      const ui = {
+        open: false, tab: 'market', badgePos: null, badgeW: null, dockH: null, hydrated: false,
+        _fns: [],
+        subscribe: function (fn) {
+          this._fns.push(fn)
+          const self = this
+          return function () {
+            const i = self._fns.indexOf(fn)
+            if (i !== -1) self._fns.splice(i, 1)
+          }
+        },
+        notify: function () {
+          const fns = this._fns.slice()
+          for (let i = 0; i < fns.length; i++) { try { fns[i]() } catch (e) { /* ignore */ } }
+        },
+        set: function (patch) {
+          let ch = false
+          for (const k in patch) {
+            if (this[k] !== patch[k]) { this[k] = patch[k]; ch = true }
+            if (k === 'open') this.openTouched = true
+            if (k === 'tab') this.tabTouched = true
+          }
+          if (ch) {
+            this.notify()
+            // 打开面板的 set 发生在面板组件订阅建立之前（订阅在挂载后才生效）——
+            // 若无人续触发 ui.set，open=true 永远不落盘，刷新后面板关着。open 翻转直接触发落盘。
+            if ('open' in patch) { try { persist() } catch (e) { /* 初始化前忽略 */ } }
+          }
+        }
+      }
+      return ui
+    }
+    // ---- qa-extract-end: pure-helpers ----
 
     // A股开市 ref：接共享指数层的真实 market status（节假日感知——纯时区推算会在法定假日空转一整天）。
     // 多处订阅（详情活性/K线滚动）零额外上游请求（共享层去重）。
@@ -352,50 +480,14 @@ return {
       }, [])
       return ref
     }
-    // 按标的代码判所属市场是否开市：SH/SZ/BJ → A股真实 status；4-5 位纯数字 → 港股；其余 → 美股。
-    // 港美股无共享状态源退回时区推算（假日空转可接受：数据不变，仅多几个被 TTL 吞掉的请求）。
-    function sessionOpenFor(symbol, aOpenRef) {
-      if (/^(SH|SZ|BJ)/.test(symbol)) return !!(aOpenRef && aOpenRef.current)
-      if (/^[0-9]{4,5}$/.test(symbol)) return hkSession() === '盘中'
-      return usSession() === '盘中'
-    }
 
     // ---------- 共享 UI 状态：面板开合 / 当前标签 / 徽章位置 ----------
-    const ui = {
-      open: false, tab: 'market', badgePos: null, badgeW: null, dockH: null, hydrated: false,
-      _fns: [],
-      subscribe: function (fn) {
-        this._fns.push(fn)
-        const self = this
-        return function () {
-          const i = self._fns.indexOf(fn)
-          if (i !== -1) self._fns.splice(i, 1)
-        }
-      },
-      notify: function () {
-        const fns = this._fns.slice()
-        for (let i = 0; i < fns.length; i++) { try { fns[i]() } catch (e) { /* ignore */ } }
-      },
-      set: function (patch) {
-        let ch = false
-        for (const k in patch) {
-          if (this[k] !== patch[k]) { this[k] = patch[k]; ch = true }
-          // 水合前用户已交互过的字段不做回滚（页面刚加载就点开面板/切标签，不被迟到的旧持久化打回）
-          if (k === 'open') this.openTouched = true
-          if (k === 'tab') this.tabTouched = true
-        }
-        if (ch) {
-          this.notify()
-          // 打开面板的 set 发生在面板组件订阅建立之前（订阅在挂载后才生效）——
-          // 若无人续触发 ui.set，open=true 永远不落盘，刷新后面板关着。open 翻转直接触发落盘。
-          if ('open' in patch) { try { saveUi() } catch (e) { /* 初始化前忽略 */ } }
-        }
-      }
-    }
-
+    // 实现是 pure-helpers 区的 makeUiStore 工厂（P1-B）；saveUi 先定义（工厂需要它作 persist），
+    // 其闭包引用的 ui 在首次防抖触发前必然完成初始化。
     const saveUi = ctx.debounce(function () {
       call('ui.set', { tab: ui.tab, open: ui.open, badgePos: ui.badgePos, badgeW: ui.badgeW, dockH: ui.dockH }).catch(function () { /* 忽略 */ })
     }, 800)
+    const ui = makeUiStore(saveUi)
 
     // 徽章拖拽引用（实例唯一）
     let badgeDrag = null
@@ -547,23 +639,7 @@ return {
         '图表引擎（KLineChart）未加载：静态安装形态自带，动态调试会话不含 vendored 库')
     }
 
-    // rows 归一化：面板行为 {timestamp(ms),open,high,low,close,volume}；卡片行为 {time(ISO),...} → 补 timestamp
-    function klcNormRows(rows) {
-      return (rows || []).map(function (r) {
-        if (r.timestamp) return r
-        const t = r.time ? Date.parse(r.time) : NaN
-        return Object.assign({}, r, { timestamp: isNaN(t) ? 0 : t })
-      }).filter(function (r) { return r.timestamp > 0 })
-    }
-
-    function klcPrecision(rows, hint) {
-      if (hint != null) return hint
-      try {
-        const s = String(rows.length ? rows[rows.length - 1].close : '')
-        const d = (s.split('.')[1] || '').length
-        return Math.max(0, Math.min(4, d || 2))
-      } catch (e) { return 2 }
-    }
+    // klcNormRows / klcPrecision 已移入 pure-helpers 标记区（P1-B，qa 可提取直测）
 
     // ---------- K线蜡烛图（KLineChart：内置 MA/VOL、滚轮缩放、拖拽平移、右拖自动加载更早历史） ----------
     function KlineChart(props) {

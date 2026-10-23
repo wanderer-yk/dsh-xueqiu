@@ -13,11 +13,20 @@
 #   6. POST /xq-rpc quote                   — 真实行情返回 ok
 #   7. 栅栏: 恶意 Origin 得 403
 # 可选: 环境变量 SMOKE_BROWSER=1 且装有 agent-browser 时，追加浏览器徽章检查。
+#
+# 数据关卡分级（P0-C）：SMOKE_LIVE=strict（默认，本地/发版 tag）上游错误一律 FAIL；
+# SMOKE_LIVE=warn（CI PR 路径）时上游风控类错误降级为 UPSTREAM_BLOCKED 警告——
+# 结构关卡（1-5/7）仍然全数 FAIL。理由：匿名通道是否被雪球边缘拦截取决于出口 IP，
+# 与插件好坏无关；PR 上被它劫持会掩盖真正的结构性回归（旧 SMOKE_CI 逃生口的正式化）。
 set -uo pipefail
 
 PLUGIN_DIR=${1:-$(cd "$(dirname "$0")/.." && pwd)}
 PLUGIN_DIR=$(cd "$PLUGIN_DIR" && pwd)
 PORT=${SMOKE_PORT:-3199}
+# SMOKE_LIVE 未设时回退旧 SMOKE_CI 语义（设置了即 warn），默认 strict
+if [ -z "${SMOKE_LIVE:-}" ]; then
+  [ -n "${SMOKE_CI:-}" ] && SMOKE_LIVE=warn || SMOKE_LIVE=strict
+fi
 # 默认找本地 npx 缓存里的 dsh（避免依赖全局 dsh 命令）；可被 DSH_BIN 覆盖
 if [ -z "${DSH_BIN:-}" ]; then
   DSH_BIN=$(ls "$HOME"/.npm/_npx/*/node_modules/.bin/dsh 2>/dev/null | head -1)
@@ -30,6 +39,7 @@ FAIL=0
 
 say()  { printf '%s\n' "$*"; }
 pass() { say "  ✅ $*"; }
+warn() { say "  ⚠️  $* (SMOKE_LIVE=$SMOKE_LIVE)"; }
 fail() { say "  ❌ $*"; FAIL=1; }
 
 cleanup() {
@@ -118,10 +128,12 @@ if [[ "$BUNDLE" == *__ModuleLoader__* ]]; then
 else
   fail "bundle 缺 __ModuleLoader__.load — 浏览器端会 SyntaxError（裸函数体）"
 fi
-if [[ "$BUNDLE" == *"host.call"* ]]; then
-  fail "bundle 残留 host.call — 静态模式下会 plugin-not-running"
+# P1-A 起传输层是运行时接缝：host.call 合法存在于 typeof host 守卫内（静态环境走不到），
+# 但静态 fetch 分支必须存在（缺了则浏览器端全部 RPC 404/崩）。旧"无 host.call 残留"断言随之废弃。
+if [[ "$BUNDLE" == *"/xq-rpc"* && "$BUNDLE" == *"typeof host"* ]]; then
+  pass "bundle 含传输接缝（fetch /xq-rpc 分支 + typeof host 守卫）"
 else
-  pass "bundle 无 host.call 残留"
+  fail "bundle 缺静态传输分支 — 浏览器端 RPC 会全挂"
 fi
 
 # ---- 6. RPC 真实数据 ----
@@ -130,9 +142,9 @@ say "-- 6/7 /xq-rpc 行情"
 QUOTE=$(curl -s -m 30 -X POST "http://127.0.0.1:$PORT/xq-rpc" -H 'Content-Type: application/json' -H "Origin: http://127.0.0.1:$PORT" -d '{"action":"quote","args":{"symbols":"SH600519"}}')
 if [[ "$QUOTE" == *'"ok":true'* ]]; then
   pass "RPC 返回真实行情"
-elif [ -n "${SMOKE_CI:-}" ] && [[ "$QUOTE" == *'cookie'* || "$QUOTE" == *'network'* || "$QUOTE" == *'风控'* ]]; then
-  # CI 数据中心 IP 常被雪球风控拦截：通道本身已验证（返回了结构化 JSON），上游数据只在本地强制
-  pass "RPC 通道正常（CI 出口 IP 被雪球风控拦截，跳过数据断言）"
+elif [ "$SMOKE_LIVE" = "warn" ] && [[ "$QUOTE" == *'[seed_blocked]'* || "$QUOTE" == *'[cookie_expired]'* || "$QUOTE" == *'[waf]'* || "$QUOTE" == *'[empty'* || "$QUOTE" == *'[rate_limited]'* || "$QUOTE" == *'[network]'* ]]; then
+  # 上游风控/网络类错误：通道本身已验证（拿到了结构化 JSON 错误，说明 RPC/fence/分发全活）
+  warn "UPSTREAM_BLOCKED（上游拒绝匿名请求，非插件损坏）: $(echo "$QUOTE" | head -c 120)"
 else
   fail "RPC 失败: $(echo "$QUOTE" | head -c 120)"
 fi

@@ -120,7 +120,9 @@ dsh plugin --profile web add ./dsh-xueqiu
 - **请求闸门**：并发上限 2、请求间最小间隔 100ms，模拟网页端节奏，降低风控概率。
 - **30s 看门狗**：单个请求悬挂超 30s 即强制释放调度槽并报错，不会冻结后续所有请求。
 - **TTL 缓存 + in-flight 去重**：相同 URL 短时间窗内直接命中缓存，并发重复请求共享同一 Promise。
-- **Cookie 自愈**：匿名 cookie 失效（错误码 400016）或被风控返回空响应时，自动重新访问雪球首页播种新 cookie 再重试。
+- **匿名 Cookie 落盘复用**：播种成功的匿名 token 持久化到 `$DSH_HOME/dsh-xueqiu/`，进程重启/新会话免播种直接复用（2026-10 实测部分网络 IP 被雪球边缘节点拦截、播种拿不到 token——活进程靠内存 cookie 存活而冷启动即死的教训）；文件 cookie 失效时自动重播种自愈。
+- **Cookie 自愈**：匿名 cookie 失效（错误码 400016）或被风控返回空响应时，自动重新访问雪球播种新 cookie 再重试（种子请求带浏览器导航头收窄指纹差异）。
+- **seed_blocked 快速失败**：播种链被边缘拦截且上游明确拒绝（400016）时不再空转重试，直接报出可操作指引（粘贴浏览器 Cookie 登录解锁），`debug` RPC 的环形事件流（最近 50 条播种/重试/落盘事件）可一键看现场。
 - **限频退避**：遇到"请求频繁"按 2s→4s 指数退避后重试。
 - **渐进渲染**：详情页报价 + K线先行上屏，分时/财务/KOL 异步到达后增量合并。
 
@@ -168,7 +170,7 @@ dsh-xueqiu/
 按安装说明重启一次 `dsh web`（插件行按启动缓存发现），再硬刷新页面（Ctrl/Cmd+Shift+R）。仍无面板时看右下角有无行情区域——区域在则点它展开。
 
 **Q: 行情数据突然全空/报错？**
-雪球匿名 cookie 偶发被风控（错误码 400016 或空响应）。插件会自动重播种 cookie 并重试；连续失败时等 1–2 分钟再点「刷新」，或收起面板降低请求频率。
+雪球匿名 cookie 偶发被风控（错误码 400016 或空响应）。插件会自动重播种 cookie 并重试；播种成功的 cookie 会落盘，重启后免播种复用。若报 `[seed_blocked] 匿名 Cookie 获取失败（雪球边缘风控拦截或网络不可达）`，说明当前出口 IP 被雪球边缘节点拦截（不是插件故障）——等 1–2 分钟再试，或在面板右上「登录」粘贴浏览器 Cookie 直接解锁全部数据。`debug` RPC 的 events 字段（最近 50 条播种/重试事件）可供排障。
 
 **Q: K线周期里分时下为什么没有周期按钮？**
 分时模式只展示当日分钟线，K线模式才有 7 档周期，属设计行为。
@@ -177,7 +179,7 @@ dsh-xueqiu/
 不准。时段按每周一至周五的固定钟点本地推算，不含法定节假日调休，仅供参考。
 
 **Q: 自选股和面板设置存在哪？**
-宿主本地文件 `~/.xueqiu-watchlist.json` 与 `~/.xueqiu-ui-state.json`（含区域宽度/位置），与浏览器 localStorage 无关，换浏览器不丢。
+宿主本地稳定目录 `$DSH_HOME/dsh-xueqiu/`（默认 `~/.dsh/dsh-xueqiu/`）下的 `.xueqiu-watchlist.json` / `.xueqiu-ui-state.json` / `.xueqiu-login.json`（登录）与 `.xueqiu-anon.json`（匿名 cookie 缓存，1.25.0 起），各带 `.bak` 损坏兜底；沙箱拒绝时透明回退工作区目录。与浏览器 localStorage 无关，换浏览器不丢，也不随 `dsh web` 启动目录漂移（v1.22.12 起的稳定目录行为）。
 
 **Q: 会不会影响 DSH 本体？**
 插件 UI 全部挂在官方槽位（`conversation.input.dock` / `shell.overlay` / `conversation.composer.dock`），卸载即完全消失，不改 DSH 源码。
@@ -190,6 +192,12 @@ dsh-xueqiu/
 
 ## 📋 更新日志
 
+- **1.25.0**（2026-10-23）
+  - 修复：**匿名链路对冷启动的脆弱性（当日实测事故）**——部分网络 IP 上两个种子 URL 均被雪球边缘节点（TencentEdgeOne）拦截（HTTP 5xx 不发 set-cookie），活进程靠内存 cookie 存活、重启即死板。三层加固：① 播种成功的匿名 cookie 落盘 `$DSH_HOME/dsh-xueqiu/.xueqiu-anon.json`，冷启动先读文件免播种（失效自动重播种自愈并覆盖）；② 种子请求补浏览器导航头（Accept/Accept-Language/sec-fetch 系）+ `--compressed` 收窄指纹差异，单种子超时 12s→8s（最坏 2×10s+12s 不再撞穿 30s 看门狗）；③ 播种失败 + 上游 400016 时快速失败为 `[seed_blocked]`，文案直接引导"面板右上登录粘贴 Cookie"，不再空转 3 轮上游请求循环报错。
+  - 新增：`qa/probe-seed.mjs` 播种探针（候选 URL × 头组合实测 set-cookie 返回，扩容播种链的决策工具，不进 CI）。
+  - 重构：**client 传输层与样式注入改运行时接缝**（`typeof host` / `typeof styles` 判定），`gen-static.py` 不再做 DYNAMIC_CALL/STATIC_CALL 整函数文本替换——每次改 `call()` 从此不必同步改生成器（锚点漂移即失败的一整类维护负担消失）。
+  - 新增：**client 纯逻辑层单测**（`qa/client-pure.mjs`，61 断言）——格式化/交易时段/K线归一化 + `makeIndexPoll`/`makeUiStore` 工厂化（依赖全注入：in-flight 去重、订阅回放、隐藏门、5s 节流、open 即时落盘全可测）；host 缓存工厂 `makeCache` 时钟注入（`qa/cache.mjs`，16 断言：TTL 过期/FIFO 淘汰/24h 清扫——unit.mjs 曾自认"伪造时间不好做"的盲区）；传输接缝路由回归（`qa/client-bundle.mjs`，13 断言：生成物伪浏览器求值防 TDZ + 动态门面/普通函数/无 host 三环境分支路由——后者源自复审发现的接缝守卫缺陷：`typeof host.call` 对任何同名全局函数都为真，已加 `!== Function.prototype.call` 收紧）。三套件全部接入本地与 CI 关卡。
+  - 加固：`debug` RPC 增加最近 50 条环形事件流（播种成败/重试类型/落盘失败，不含 cookie 值）；`watchlist.pull` 复用同步结果消除双倍上游请求；冒烟数据关卡分级 `SMOKE_LIVE=strict|warn`（PR 路径上游拦截降级警告，结构关卡仍全 FAIL），CI 真连雪球的 live 步骤移至每日定时；`xqIso(null)` 不再渲染 1970-01-01；`fmtFullDay`/`pad2` 重复定义合并；契约测试 UA 改从 host.js 单一真源提取（曾 Chrome/126 vs /120 漂移）；新增 `test:offline` 聚合脚本与 `engines` 字段。
 - **1.24.1**（2026-10-22）
   - 修复：**面板关闭时拖动徽章的位置不落盘**——`onUp` 提交 `badgePos` 后未调 `saveUi`，而落盘订阅者（DockPanel）仅在面板打开时挂载；徽章交互常态恰发生在面板关闭时，刷新后位置回退（对照：调宽手柄 `onGripUp` 一直有显式落盘）。现为拖拽松手后显式 `saveUi()`。
   - 修复：**越屏位置的钳制修正不落盘**——hydrate 钳制后的 `ui.set` 同样无人落盘，host 里永久残留越屏值（如 99999），每次加载重复钳制。现钳制确有修正时立即 `saveUi()`。

@@ -19,6 +19,20 @@ export default {
     let login = null
     let cloudPid = null   // 默认自选组合 pid（首次云端操作时探测并缓存）
 
+    // ---- debug 环形事件（P3）：低频关键事件留痕，debug RPC 可查（不含任何 cookie 值）。
+    // 背景：host 里大量防御性静默 catch，线上排障（如 2026-10 播种被边缘拦截）只能靠猜；
+    // 50 条环形 buffer 记播种成败/重试类型/落盘失败，足够还原一次故障现场。
+    const dbgRing = []
+    function dbgEvent(kind, detail) {
+      try {
+        dbgRing.push({ at: Date.now(), kind: String(kind), detail: detail == null ? '' : String(detail) })
+        while (dbgRing.length > 50) dbgRing.shift()
+      } catch (e) { /* ignore */ }
+    }
+
+    // 播种失败冷却窗判定（5s）：窗内重播种必然直接返回空，重试链无意义
+    function seedDown() { return !!state.seedFailedAt && Date.now() - state.seedFailedAt < 5000 }
+
     // ---- 请求调度：并发 2 + 最小间隔 100ms（对齐雪球网页端行为，留有安全余量）----
     const MIN_GAP_MS = 100
     const MAX_CONCURRENCY = 2
@@ -80,34 +94,51 @@ export default {
     }
 
     // ---- TTL 缓存 + in-flight 去重：同一 URL 在途请求共享同一个 Promise ----
-    const cache = new Map()   // key -> { at, value }
-    const inflight = new Map() // key -> Promise
-    const CACHE_MAX_KEYS = 200
-
-    function cacheGet(key, ttl) {
-      const e = cache.get(key)
-      if (e && ttl > 0 && Date.now() - e.at < ttl) return e.value
-      if (e && ttl > 0) cache.delete(key)   // 已过期：顺手清除（前插历史 key 零复用，不删则驻留到 FIFO 挤出）
-      return undefined
-    }
-
-    // 淘汰：kline 的 begin 参数按分钟取整，每分钟产生新 URL → 新条目；不清理则无界泄漏。
-    // 写入时顺手清一轮过期条目（O(n) 但 n 被 200 上限钳住），再按容量兜底删最旧。
-    function cachePut(key, value) {
-      cache.set(key, { at: Date.now(), value: value })
-      if (cache.size > CACHE_MAX_KEYS) {
-        const now = Date.now()
-        for (const k of Array.from(cache.keys())) {
-          const e = cache.get(k)
-          // 无 TTL 元信息（各调用点 ttl 不同）：超过 24h 的条目一律可清
-          if (now - e.at > 86400000) cache.delete(k)
+    // 工厂形态（now 可注入）：qa/cache.mjs 直测 TTL 过期/FIFO 淘汰/24h 清扫——
+    // 此前 Date.now() 散落实现内，单测注释自认"伪造时间不好做"，过期路径零覆盖。
+    // ---- qa-extract-begin: cache-factory ----
+    // 本区可被 qa/cache.mjs 按标记整段提取直测（见 client.js pure-helpers 区说明）
+    function makeCache(opts) {
+      opts = opts || {}
+      const maxKeys = opts.maxKeys || 200
+      const now = opts.now || function () { return Date.now() }
+      const cache = new Map()     // key -> { at, value }
+      const inflight = new Map()  // key -> Promise
+      function get(key, ttl) {
+        const e = cache.get(key)
+        if (e && ttl > 0 && now() - e.at < ttl) return e.value
+        if (e && ttl > 0) cache.delete(key)   // 已过期：顺手清除（前插历史 key 零复用，不删则驻留到 FIFO 挤出）
+        return undefined
+      }
+      // 淘汰：kline 的 begin 参数按分钟取整，每分钟产生新 URL → 新条目；不清理则无界泄漏。
+      // 写入时顺手清一轮过期条目（O(n) 但 n 被上限钳住），再按容量兜底删最旧。
+      function put(key, value) {
+        cache.set(key, { at: now(), value: value })
+        if (cache.size > maxKeys) {
+          const t = now()
+          for (const k of Array.from(cache.keys())) {
+            const e = cache.get(k)
+            // 无 TTL 元信息（各调用点 ttl 不同）：超过 24h 的条目一律可清
+            if (t - e.at > 86400000) cache.delete(k)
+          }
+        }
+        while (cache.size > maxKeys) {
+          const oldest = cache.keys().next().value   // Map 保插入序，最旧在最前
+          cache.delete(oldest)
         }
       }
-      while (cache.size > CACHE_MAX_KEYS) {
-        const oldest = cache.keys().next().value   // Map 保插入序，最旧在最前
-        cache.delete(oldest)
+      return {
+        get: get, put: put,
+        size: function () { return cache.size },
+        clear: function () { cache.clear() },   // 身份切换（登录/注销/首载）全量失效；in-flight 不动（与旧实现一致）
+        inflightGet: function (key) { return inflight.get(key) },
+        inflightSet: function (key, p) { inflight.set(key, p) },
+        inflightDelete: function (key) { inflight.delete(key) },
+        inflightKeys: function () { return Array.from(inflight.keys()) },
       }
     }
+    // ---- qa-extract-end: cache-factory ----
+    const cache = makeCache({ maxKeys: 200 })
 
     function enc(s) {
       try { return encodeURIComponent(String(s)) } catch (e) { return String(s) }
@@ -133,27 +164,74 @@ export default {
       return proc.result()
     }
 
+    // ---- 匿名 cookie 落盘复用（P0-B）：播种成功的匿名 token 持久化到稳定目录，
+    // 冷启动（进程重启/新会话）先读文件免播种。2026-10-22 实测：部分网络 IP 上
+    // 两个种子 URL 均被 TencentEdgeOne 拦截（HTTP 5xx 且不发 set-cookie），活进程
+    // 靠内存 cookie 存活、冷启动即死板。文件 cookie 失效（400016/waf）时走既有
+    // 重播种链自愈，文件随下次播种成功覆盖（失败不删——上次的好 token 仍可能有效）。
+    // 匿名 token 无账号身份，敏感度远低于登录 cookie，不额外收紧权限。
+    let anonLoadTried = false
+    async function loadAnonCookie() {
+      if (anonLoadTried) return ''   // 一次性：读到坏文件/无文件也不反复读盘
+      anonLoadTried = true
+      const fs = ctx.get('fs')
+      const sp = ctx.get('sandboxPolicy')
+      const root = sp && sp.workspaceRoot ? sp.workspaceRoot : null
+      if (!fs) return ''
+      try {
+        const parsed = await stateReadJson('.xueqiu-anon.json', fs, root)
+        if (parsed && /xq_a_token=/.test(String(parsed.cookie || ''))) {
+          state.cookie = String(parsed.cookie)
+          dbgEvent('anon-cookie', 'load-from-disk')
+          return state.cookie
+        }
+      } catch (e) { /* 无文件或损坏：走播种 */ }
+      return ''
+    }
+    function persistAnonCookie(cookie) {
+      const fs = ctx.get('fs')
+      const sp = ctx.get('sandboxPolicy')
+      const root = sp && sp.workspaceRoot ? sp.workspaceRoot : null
+      if (!fs) return
+      stateWrite('.xueqiu-anon.json', JSON.stringify({ cookie: cookie, at: Date.now() }), fs, root)
+        .then(function () { dbgEvent('anon-cookie', 'persist-ok') })
+        .catch(function (e) { dbgEvent('anon-cookie', 'persist-fail') })
+    }
+
     let cookieSeeding = null
     async function ensureCookie(force) {
       if (state.cookie && !force) return state.cookie
       // 播种失败冷却：上游断网/被封时每个请求都打 2 个种子 curl 会形成风暴，失败后 5s 内直接走无 cookie 路径
-      if (state.seedFailedAt && Date.now() - state.seedFailedAt < 5000) return ''
-      if (cookieSeeding) return cookieSeeding // 并发去重：同一时刻只播种一次
+      if (seedDown()) return ''
+      if (cookieSeeding) return cookieSeeding // 并发去重：同一时刻只播种一次（读盘与播种共用该通道）
       const shell = getShell()
       if (!shell) return ''
       cookieSeeding = (async function () {
+      // 落盘复用优先（非 force）：上个会话的好 cookie 免播种——force 意味着当前 cookie
+      // 已被上游判失效，盘上那份通常同源更旧，直接走重播种
+      if (!force && await loadAnonCookie()) return state.cookie
       // 播种 URL 兜底链：/hq 无 WAF 挑战、直接发全套匿名 token（PR#2）；
       // 首页 / 在部分地区会被阿里云 WAF JS 挑战接管（只发 acw_tc），作第一备选。
       // 逐个尝试，拿到 xq_a_token 即成功；全部失败返回空串走无 cookie 路径。
+      // 候选 URL 扩容请先跑 node qa/probe-seed.mjs 实测（勿凭猜测加链）。
       const seedUrls = [
         'https://xueqiu.com/hq',
         'https://www.xueqiu.com/'
       ]
+      // 播种请求指纹硬化：裸 curl 的头组合（无 Accept-Language/sec-fetch）易被边缘节点
+      // （TencentEdgeOne）识别为非浏览器流量直接拦（HTTP 5xx 不发任何 cookie）。补齐
+      // 浏览器导航请求的典型头 + --compressed 收窄指纹差异；效果对照见 qa/probe-seed.mjs。
+      const SEED_HDRS = " -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'" +
+        " -H 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8'" +
+        " -H 'Sec-Fetch-Dest: document' -H 'Sec-Fetch-Mode: navigate' -H 'Sec-Fetch-Site: none' -H 'Sec-Fetch-User: ?1'" +
+        " -H 'Upgrade-Insecure-Requests: 1'"
       let seen = {}
       let pairs = []
       for (let i = 0; i < seedUrls.length; i++) {
-        const cmd = CURL + " -s -L --max-time 12 -D - -o " + NULL_DEV + " '" + seedUrls[i] + "' -H 'User-Agent: " + UA + "'"
-        const spec = shell.resolve({ command: cmd, timeoutMs: 15000, stdoutMaxBytes: 65536 })
+        // 单种子 8s（spec 10s）：最坏 2×10s + 数据请求 12s 仍在 30s 看门狗预算内
+        // （曾为 12s/15s，最坏 42s 会撞穿看门狗）
+        const cmd = CURL + " -s -L --compressed --max-time 8 -D - -o " + NULL_DEV + " '" + seedUrls[i] + "' -H 'User-Agent: " + UA + "'" + SEED_HDRS
+        const spec = shell.resolve({ command: cmd, timeoutMs: 10000, stdoutMaxBytes: 65536 })
         let res = null
         try { res = await runShell(shell, spec) } catch (e) { res = null }
         if (!res || res.exitCode !== 0) continue
@@ -171,12 +249,15 @@ export default {
       if (!seen.xq_a_token) {
         state.cookie = ''
         state.seedFailedAt = Date.now()   // 记录失败时刻，供冷却窗口判断
+        dbgEvent('seed-fail', 'no-token')
         return ''
       }
       state.seedFailedAt = 0
       // kline 端点要求 cookie 里存在 u=<id>；优先用种子响应里的真实 u，缺失才补随机值
       if (!seen.u) pairs.push('u=' + String(Date.now()) + String(Math.floor(Math.random() * 1e6)))
       state.cookie = pairs.join('; ')
+      persistAnonCookie(state.cookie)   // 落盘供冷启动复用（尽力而为）
+      dbgEvent('seed-ok', 'cookies=' + pairs.length)
       return state.cookie
       })()
       const r = cookieSeeding
@@ -238,7 +319,7 @@ export default {
       let anonymous = opts.anonymous === true
 
       async function attempt(depth) {
-        const err = await (async function () {
+        let err = await (async function () {
           let text
           try { text = await curl(url, { cookie: opts.cookie, anonymous: anonymous }) } catch (e) { return { kind: 'network', message: e.message, retryable: depth < 1 } }
           if (!text) return { kind: 'empty', message: '雪球返回空响应（可能被风控）', retryable: true }
@@ -263,14 +344,30 @@ export default {
         })()
 
         if (!err.kind) return err.data
-        if (!err.retryable || depth >= 2) throw new Error('[' + err.kind + '] ' + err.message)
+
+        // 播种失败短路（P0-A）：种子链刚失败（冷却窗内）时，cookie_expired 的重试链只是在
+        // 烧时间——重播种必然直接返回空。统一转译为不可重试的 seed_blocked，文案直接给出
+        // 出路（粘贴 Cookie 登录），不再让用户看 [cookie_expired] 循环报错。
+        // 仅转译"实际匿名"（未登录或已降级）的 cookie_expired：那是"缺匿名 cookie 被上游
+        // 明确拒绝"的确定性信号；登录态首轮 400016 另有降级匿名重试路径（降级后的下一轮
+        // 若仍 400016 且播种失败，同样落入此转译）。empty/network 等瞬时故障保留重试。
+        if (err.kind === 'cookie_expired' && err.retryable && (anonymous || !login) && opts.cookie === undefined && seedDown()) {
+          dbgEvent('seed-blocked', 'cookie_expired@depth' + depth)
+          err = { kind: 'seed_blocked', message: '匿名 Cookie 获取失败（雪球边缘风控拦截或网络不可达）。可在面板右上「登录」粘贴浏览器 Cookie 解锁全部数据，或稍后重试', retryable: false }
+        }
+
+        if (!err.retryable || depth >= 2) {
+          dbgEvent('rpc-fail', err.kind + '@depth' + depth)
+          throw new Error('[' + err.kind + '] ' + err.message)
+        }
+        dbgEvent('retry', err.kind + '@depth' + depth)
 
         if (err.kind === 'cookie_expired' || err.kind === 'empty' || err.kind === 'empty_kline' || err.kind === 'waf') {
           if (err.kind === 'cookie_expired' && !anonymous && opts.cookie === undefined && login) {
             anonymous = true   // 登录 Cookie 被判失效：先降级匿名重试
           }
           if (err.kind === 'waf') {
-            // 播种昂贵（2 个种子 curl，最坏 2×12s）：只允许首轮且匿名路径触发，避免重试链撞穿 30s 看门狗；
+            // 播种昂贵（2 个种子 curl，单种子 10s 上限）：只允许首轮且匿名路径触发，避免重试链撞穿 30s 看门狗；
             // 带显式 cookie/登录态的请求直接抛错不重试：重播种出的匿名 cookie 用不上
             if (depth > 0 || opts.cookie !== undefined || login) {
               throw new Error('[waf] 雪球返回 WAF 挑战页（当前请求不适用重播种，请稍后再试）')
@@ -286,16 +383,16 @@ export default {
         return attempt(depth + 1)
       }
 
-      const hit = cacheGet(url, ttl)
+      const hit = cache.get(url, ttl)
       if (hit !== undefined) return Promise.resolve(hit)
-      const pending = inflight.get(url)
+      const pending = cache.inflightGet(url)
       if (pending) return pending
       const p = gate(function () { return attempt(0) }).then(function (data) {
-        if (ttl > 0) cachePut(url, data)
+        if (ttl > 0) cache.put(url, data)
         return data
       })
-      p.then(function () { inflight.delete(url) }, function () { inflight.delete(url) })
-      inflight.set(url, p)
+      p.then(function () { cache.inflightDelete(url) }, function () { cache.inflightDelete(url) })
+      cache.inflightSet(url, p)
       return p
     }
 
@@ -421,7 +518,7 @@ export default {
       const period = PERIODS[String(args.period)] ? String(args.period) : 'day'
       const count = Math.min(Math.max(parseInt(args.count, 10) || 120, 5), 500)
       // 代码白名单：symbol 直接进 URL/shell 命令，剥除非白名单字符（含单引号）——
-      // 与 actQuote 的"拒绝"不同，这里是有意静默纠错（批量/单值输入容错，注入防御由 curl 层兜底）
+      // 与 actQuote 的"整串过滤"不同，这里对单值输入做逐字符纠错（批量/单值输入容错，注入防御由 curl 层兜底）
       const symbol = (String(args.symbol || '').match(/[A-Za-z0-9_.]/g) || []).join('').slice(0, 16)
       if (!symbol) return { period: null, rows: [] }   // 剥除后为空（纯非法字符/缺参）：立即空结果，不进重试链
       // begin 按分钟取整，保证 TTL 窗口内缓存 key 稳定（count 为负，返回的是最近 N 根）。
@@ -575,7 +672,7 @@ export default {
       const base = dir ? dir + '/' + name : name
       const target = await fs.resolve(base, { cwd: root })
       await fs.writeText(target, text)
-      try { await fs.writeText(await fs.resolve(base + '.bak', { cwd: root }), text) } catch (e) { /* bak 尽力而为 */ }
+      try { await fs.writeText(await fs.resolve(base + '.bak', { cwd: root }), text) } catch (e) { dbgEvent('state-bak-fail', name) /* bak 尽力而为 */ }
       // 登录凭证收紧权限（尽力而为）：fs 无 chmod 原语，借 shell 执行；失败不阻塞（默认 0644 的威胁模型见 README）
       if (name === '.xueqiu-login.json') {
         try {
@@ -641,12 +738,15 @@ export default {
     // - 静默失败：cookie 过期等异常不影响 watchlist.get 返回
     let syncInflight = false
     const SYNC_INTERVAL_MS = 10 * 60 * 1000
+    // 返回 { changed, symbols }：changed=云端镜像是否改动本地；symbols=本次实际拿到的
+    // 云端列表（空数组=没拿到：失败/空云端/节流跳过）。watchlist.pull 依赖 symbols
+    // 判断是否需要二次确认拉取，避免旧实现"同步成功且无变化仍无条件再拉一遍"。
     async function maybeAutoSync(force) {
       const lg = await loadLogin()
-      if (!lg || syncInflight) return false
+      if (!lg || syncInflight) return { changed: false, symbols: [] }
       const wl = await loadWatchlist()
       const last = Number(wl.lastSyncAt) || 0
-      if (!force && Date.now() - last < SYNC_INTERVAL_MS) return false
+      if (!force && Date.now() - last < SYNC_INTERVAL_MS) return { changed: false, symbols: [] }
       syncInflight = true
       try {
         const cloud = await fetchCloudWatchlist()
@@ -656,7 +756,7 @@ export default {
           wl.lastSyncAt = Date.now()
           watchlist = wl
           await saveWatchlist()
-          return false
+          return { changed: false, symbols: [] }
         }
         const cur = wl.symbols
         const changed = cur.length !== cloud.symbols.length || cloud.symbols.some(function (s, i) { return cur[i] !== s })
@@ -667,7 +767,7 @@ export default {
           watchlist = wl
         }
         await saveWatchlist()
-        return changed
+        return { changed: changed, symbols: cloud.symbols }
       } catch (e) {
         // 失败同样推进 lastSyncAt：cookie 过期/断网时若节流不动，watchlist.get 每 20-30s
         // 触发一次失败链（每次 3 个上游请求），日积月累形成无效请求风暴甚至触发 IP 风控
@@ -675,8 +775,8 @@ export default {
           wl.lastSyncAt = Date.now()
           watchlist = wl
           await saveWatchlist()
-        } catch (e2) { /* 落盘失败不影响内存节流 */ }
-        return false   // 静默：debug RPC 可观察 login/cookie 状态
+        } catch (e2) { dbgEvent('sync-save-fail', String((e2 && e2.message) || e2)) /* 落盘失败不影响内存节流 */ }
+        return { changed: false, symbols: [] }   // 静默：debug RPC 可观察 login/cookie 状态
       } finally {
         syncInflight = false
       }
@@ -927,9 +1027,10 @@ export default {
     async function actWatchlistPull() {
       const lg = await loadLogin()
       if (!lg) throw new Error('未登录：请先在「账号」中粘贴 Cookie 登录')
-      const changed = await maybeAutoSync(true)   // 手动按钮：绕过节流强制同步（云端为准镜像）
-      if (changed === false) {
-        // 同步判定未变化或失败：仍给按钮一个明确的拉取结果
+      const r = await maybeAutoSync(true)   // 手动按钮：绕过节流强制同步（云端为准镜像）
+      if (!r.symbols.length) {
+        // 同步未拿到云端列表（失败/空云端/后台同步进行中）：显式重拉一次确认。
+        // maybeAutoSync 已拿到列表时不再重复拉——旧实现"成功且无变化"也会白打 2 个上游请求
         const cloud = await fetchCloudWatchlist().catch(function () { return { symbols: [] } })
         if (!cloud.symbols.length) throw new Error('同步失败：无法获取云端自选（Cookie 可能已过期）')
       }
@@ -1015,7 +1116,7 @@ export default {
       'login.status': actLoginStatus, 'login.save': actLoginSave, 'login.logout': actLoginLogout,
       'ui.get': actUiGet, 'ui.set': actUiSet,
       debug: async function () {
-        return { running: running, waiters: waiters.length, inflight: Array.from(inflight.keys()), cacheKeys: cache.size, cookie: state.cookie ? 'set' : 'none', login: login ? ('uid=' + (login.uid || '?')) : 'anonymous' }
+        return { running: running, waiters: waiters.length, inflight: cache.inflightKeys(), cacheKeys: cache.size(), cookie: state.cookie ? 'set' : 'none', login: login ? ('uid=' + (login.uid || '?')) : 'anonymous', events: dbgRing.slice() }
       }
     }
 
@@ -1088,6 +1189,9 @@ export default {
       }
     }
     function xqIso(ms) {
+      // null/undefined/'' 必须在 Number() 之前拦下：Number(null)===0 会把缺时间戳
+      // 渲染成 '1970-01-01 08:00:00'（快讯缺 created_at 时的假时间）
+      if (ms === null || ms === undefined || ms === '') return null
       // 本地时区格式化（toISOString 是 UTC，中文环境会差 8 小时）
       const d = new Date(Number(ms))
       if (isNaN(d.getTime())) return null
